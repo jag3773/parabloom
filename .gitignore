@@ -1,0 +1,6 @@
+/target
+# Local parity corpora and outputs (copyrighted PDFs never belong in git)
+/corpus
+*.pdf
+!tests/fixtures/*.pdf
+__pycache__/
