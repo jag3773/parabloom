@@ -1,10 +1,8 @@
 //! Paragraph reconstruction from text blocks. No PDF library calls.
 //!
-//! Each function mirrors one in the reference script, the 2026-08-03 patched
-//! `expand_highlights.py`, including its handling of empty (infinite) boxes
-//! and Python's float and string semantics. Changing behaviour here changes
-//! highlights on books that were tuned against the Python version, so keep
-//! these functions in step with the reference.
+//! Based on the 2026-08-03 patched Python reference, retaining its float
+//! and string semantics while using column-aware grouping and conservative
+//! geometric matching to avoid changing unrelated selections.
 
 // Negated float comparisons (`!(a > b)`) are deliberate: they keep the
 // reference's `if a > b: continue` behaviour for values that don't compare.
@@ -147,7 +145,30 @@ pub fn group_lines_into_paragraphs(blocks: &[Block], params: &Params) -> Vec<Par
         if lines.is_empty() {
             continue;
         }
-        records.push((by0, lines));
+        // MuPDF can place two columns in a single block. Partition its
+        // lines by horizontal overlap before treating a block as a paragraph.
+        let mut columns: Vec<Vec<Line>> = Vec::new();
+        for line in lines {
+            let column = columns.iter().position(|column| {
+                column
+                    .iter()
+                    .any(|other| line.x0 < other.x1 + 3.0 && other.x0 < line.x1 + 3.0)
+            });
+            if let Some(i) = column {
+                columns[i].push(line);
+            } else {
+                columns.push(vec![line]);
+            }
+        }
+        let split = columns.len() > 1;
+        for lines in columns {
+            let top = if split {
+                py_min(lines.iter().map(|line| line.y0)).unwrap()
+            } else {
+                by0
+            };
+            records.push((top, lines));
+        }
     }
     // Stable sort by block top, as Python's list.sort.
     records.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -195,12 +216,8 @@ pub fn group_lines_into_paragraphs(blocks: &[Block], params: &Params) -> Vec<Par
         if ((line.x0 + line.x1) / 2.0 - page_center).abs() > 12.0 {
             return false;
         }
-        if page_has_body_margin {
-            if let Some(m) = modal_x0 {
-                if (line.x0 - m).abs() <= 3.0 {
-                    return false;
-                }
-            }
+        if page_has_body_margin && modal_x0.is_some_and(|m| (line.x0 - m).abs() <= 3.0) {
+            return false;
         }
         true
     };
@@ -218,7 +235,8 @@ pub fn group_lines_into_paragraphs(blocks: &[Block], params: &Params) -> Vec<Par
         let text_continues = !line_ends_with_sentence_punct(&prev.text)
             || line_starts_with_lowercase(&first.text)
             || prev.x1 >= right_margin - 5.0;
-        gap_similar && not_indented && text_continues
+        let same_column = first.x0 < prev.x1 + 3.0 && prev.x0 < first.x1 + 3.0;
+        gap_similar && same_column && not_indented && text_continues
     };
 
     let mut paragraphs: Vec<Paragraph> = Vec::new();
@@ -227,11 +245,12 @@ pub fn group_lines_into_paragraphs(blocks: &[Block], params: &Params) -> Vec<Par
     for (_, lines) in &records {
         let first = &lines[0];
 
-        if let Some(prev) = current.last() {
-            if continues_paragraph(prev, first) {
-                current.extend(lines.iter().cloned());
-                continue;
-            }
+        if current
+            .last()
+            .is_some_and(|prev| continues_paragraph(prev, first))
+        {
+            current.extend(lines.iter().cloned());
+            continue;
         }
 
         if lines.len() > 1 {
@@ -246,7 +265,12 @@ pub fn group_lines_into_paragraphs(blocks: &[Block], params: &Params) -> Vec<Par
             None => true,
             Some(prev) => {
                 let gap = first.y0 - prev.y1;
-                first.x0 > indent_x || gap > gap_threshold || (prev.x1 < 400.0 && gap > 3.0)
+                first.x0 > indent_x
+                    || gap > gap_threshold
+                    || gap < -3.0
+                    || first.x0 >= prev.x1 + 3.0
+                    || prev.x0 >= first.x1 + 3.0
+                    || (prev.x1 < 400.0 && gap > 3.0)
             }
         };
         if is_new_para && !current.is_empty() {
@@ -260,25 +284,60 @@ pub fn group_lines_into_paragraphs(blocks: &[Block], params: &Params) -> Vec<Par
     paragraphs
 }
 
-/// Index of the paragraph that contains the highlight's vertical centre, or
-/// failing that the paragraph whose vertical midpoint is nearest.
-pub fn find_paragraph_index(paragraphs: &[Paragraph], rect: &Rect) -> Option<usize> {
-    let hy = (rect.y0 + rect.y1) / 2.0;
-    for (idx, para) in paragraphs.iter().enumerate() {
-        let py0 = para[0].y0;
-        let py1 = para[para.len() - 1].y1;
-        if py0 - 3.0 <= hy && hy <= py1 + 3.0 {
-            return Some(idx);
-        }
+/// Paragraphs whose actual text-line boxes intersect the selected region.
+/// A small near-line tolerance covers rounding differences; distant regions
+/// (such as excluded footnotes and image-only areas) are left unmatched.
+pub fn find_paragraph_indices(paragraphs: &[Paragraph], rect: &Rect) -> Vec<usize> {
+    fn overlaps(line: &Line, rect: &Rect, tolerance: f64) -> bool {
+        line.x0 < rect.x1
+            && rect.x0 < line.x1
+            && line.y0 < rect.y1 + tolerance
+            && rect.y0 < line.y1 + tolerance
+            && line.x0 < line.x1
+            && line.y0 < line.y1
     }
+    if ![rect.x0, rect.y0, rect.x1, rect.y1]
+        .iter()
+        .all(|v| v.is_finite())
+        || rect.x0 >= rect.x1
+        || rect.y0 >= rect.y1
+    {
+        return Vec::new();
+    }
+    let matches: Vec<_> = paragraphs
+        .iter()
+        .enumerate()
+        .filter(|(_, para)| para.iter().any(|line| overlaps(line, rect, 0.0)))
+        .map(|(i, _)| i)
+        .collect();
+    if !matches.is_empty() {
+        return matches;
+    }
+    paragraphs
+        .iter()
+        .enumerate()
+        .filter(|(_, para)| para.iter().any(|line| overlaps(line, rect, 3.0)))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Best paragraph by intersection area, considering both axes. Returns None
+/// when no nearby text overlaps horizontally instead of guessing a paragraph.
+pub fn find_paragraph_index(paragraphs: &[Paragraph], rect: &Rect) -> Option<usize> {
+    let matches = find_paragraph_indices(paragraphs, rect);
     let mut best = None;
-    let mut best_dist = f64::INFINITY;
-    for (idx, para) in paragraphs.iter().enumerate() {
-        let mid = (para[0].y0 + para[para.len() - 1].y1) / 2.0;
-        let dist = (hy - mid).abs();
-        if dist < best_dist {
-            best_dist = dist;
+    let mut best_area = -1.0;
+    for idx in matches {
+        let area: f64 = paragraphs[idx]
+            .iter()
+            .map(|line| {
+                (line.x1.min(rect.x1) - line.x0.max(rect.x0)).max(0.0)
+                    * (line.y1.min(rect.y1) - line.y0.max(rect.y0)).max(0.0)
+            })
+            .sum();
+        if area > best_area {
             best = Some(idx);
+            best_area = area;
         }
     }
     best
@@ -325,9 +384,12 @@ pub fn detect_page_continuations(page_paragraphs: &[Vec<Paragraph>]) -> Vec<bool
             }
         }
 
-        let right_margin = py_max(prev_last.iter().map(|l| l.x1)).unwrap();
+        let right_margin = py_max(prev_paras.iter().flatten().map(|l| l.x1)).unwrap();
         let last = &prev_last[prev_last.len() - 1];
-        let prev_reaches_margin = last.x1 >= right_margin - MARGIN_TOLERANCE;
+        // A page containing only one line provides no independent evidence
+        // of its body margin; rely on the text signals in that case.
+        let has_margin_evidence = prev_paras.iter().map(Vec::len).sum::<usize>() > 1;
+        let prev_reaches_margin = has_margin_evidence && last.x1 >= right_margin - MARGIN_TOLERANCE;
         let prev_lacks_terminal_punct = !line_ends_with_sentence_punct(&last.text);
         let curr_starts_lowercase = line_starts_with_lowercase(&curr_first[0].text);
 
@@ -469,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn find_paragraph_by_centre_then_nearest() {
+    fn find_paragraph_by_overlap_without_distant_guesses() {
         let paras = vec![
             vec![
                 line(72.0, 100.0, 540.0, 112.0, "a"),
@@ -485,7 +547,7 @@ mod tests {
         };
         assert_eq!(find_paragraph_index(&paras, &r(102.0, 110.0)), Some(0));
         assert_eq!(find_paragraph_index(&paras, &r(201.0, 211.0)), Some(1));
-        assert_eq!(find_paragraph_index(&paras, &r(170.0, 180.0)), Some(1));
+        assert_eq!(find_paragraph_index(&paras, &r(170.0, 180.0)), None);
         assert_eq!(find_paragraph_index(&[], &r(1.0, 2.0)), None);
     }
 

@@ -2,11 +2,10 @@
 //! one covering its whole paragraph, and save.
 //!
 //! Mirrors `expand_highlights()` in the reference script, including the
-//! PyMuPDF behaviour it relies on (unrotated coordinates, deleting reply
-//! annotations with a highlight, `/BM /Multiply` and `/NM` on new
-//! highlights, and its save modes).
+//! PyMuPDF geometry and appearance conventions, with conservative matching,
+//! preservation of notes and reply threads, and safe fallback saves.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::Write;
 use std::path::Path;
@@ -18,12 +17,13 @@ use mupdf::pdf::{
 };
 use mupdf::{Buffer, Point, Quad, color::AnnotationColor};
 
-use crate::extract::page_text;
+use crate::extract::pdf_page_text;
 use crate::layout::{
-    Params, detect_page_continuations, find_paragraph_index, group_lines_into_paragraphs,
+    Params, detect_page_continuations, find_paragraph_indices, group_lines_into_paragraphs,
     walk_segments,
 };
-use crate::model::{Line, Paragraph, Rect};
+use crate::model::{Paragraph, Rect};
+use crate::save::save_replacement;
 
 /// Highlight colour used on pages that contain images.
 pub const BLUE: [f32; 3] = [0.2, 0.4, 0.8];
@@ -172,10 +172,11 @@ fn resources_have_images(
         if !obj.is_dict()? {
             continue;
         }
-        if let Some(subtype) = obj.get_dict("Subtype")? {
-            if subtype.is_name()? && subtype.as_name()? == b"Image" {
+        match obj.get_dict("Subtype")? {
+            Some(subtype) if subtype.is_name()? && subtype.as_name()? == b"Image" => {
                 return Ok(true);
             }
+            _ => {}
         }
     }
     for i in 0..n as i32 {
@@ -191,9 +192,10 @@ fn resources_have_images(
             0
         };
         if let Some(sub) = obj.get_dict("Resources")? {
-            if !seen.insert(xref) {
-                // Circular reference: PyMuPDF warns and stops scanning here.
-                return Ok(false);
+            // Reused indirect forms and cycles only end this branch. Direct
+            // objects have no xref identity; the depth limit bounds those.
+            if xref != 0 && !seen.insert(xref) {
+                continue;
             }
             if resources_have_images(&sub, seen, depth + 1)? {
                 return Ok(true);
@@ -201,30 +203,6 @@ fn resources_have_images(
         }
     }
     Ok(false)
-}
-
-/// Delete annotations on `page` that reply to `target` (`/IRT`), then the
-/// target itself, like PyMuPDF's `Page.delete_annot`.
-fn delete_with_replies(page: &mut PdfPage, target: PdfAnnotation) -> Result<(), Error> {
-    let Ok(target_xref) = target.xref() else {
-        return Ok(()); // already removed as someone else's reply
-    };
-    loop {
-        let reply = page.annotations().find(|a| {
-            a.object()
-                .get_dict("IRT")
-                .ok()
-                .flatten()
-                .and_then(|irt| irt.as_indirect().ok())
-                .is_some_and(|x| x == target_xref)
-        });
-        match reply {
-            Some(r) => page.delete_annotation(r)?,
-            None => break,
-        }
-    }
-    page.delete_annotation(target)?;
-    Ok(())
 }
 
 /// A unique `/NM` for a new highlight on this page, in the style of
@@ -308,27 +286,89 @@ fn compress_appearance(annot: &PdfAnnotation) -> Result<(), Error> {
     Ok(())
 }
 
-/// Value key for de-duplicating paragraphs on a page, as the reference does
-/// with `(para[0], para[-1])` tuples.
-fn para_key(para: &Paragraph) -> (LineKey, LineKey) {
-    (LineKey::of(&para[0]), LineKey::of(&para[para.len() - 1]))
+/// A source highlight that has a complete, valid expansion plan.
+struct Original {
+    page: usize,
+    xref: i32,
+    parent: Option<i32>,
+    rect: mupdf::Rect,
+    color: Color,
+    metadata: Vec<(String, PdfObject)>,
 }
 
-#[derive(PartialEq, Eq, Hash)]
-struct LineKey([u64; 4], String);
+impl Original {
+    fn snapshot(page: usize, annot: &PdfAnnotation) -> Result<Self, Error> {
+        let object = annot.object();
+        let mut metadata = Vec::new();
+        for i in 0..object.dict_len()? as i32 {
+            let key = object.get_dict_key(i)?.unwrap().as_name()?;
+            let key = String::from_utf8_lossy(&key).into_owned();
+            // Geometry, appearance, identity and relationship keys belong to
+            // the destination annotation. All other metadata stays intact.
+            if !matches!(
+                key.as_str(),
+                "Type"
+                    | "Subtype"
+                    | "Rect"
+                    | "QuadPoints"
+                    | "P"
+                    | "AP"
+                    | "AS"
+                    | "C"
+                    | "CA"
+                    | "BM"
+                    | "NM"
+                    | "Popup"
+                    | "IRT"
+                    | "RT"
+            ) {
+                metadata.push((key, object.get_dict_val(i)?.unwrap()));
+            }
+        }
+        Ok(Self {
+            page,
+            xref: annot.xref()?,
+            parent: object
+                .get_dict("IRT")?
+                .map(|parent| parent.as_indirect())
+                .transpose()?,
+            rect: annot.bounds()?,
+            color: Color::from_annot(annot),
+            metadata,
+        })
+    }
 
-impl LineKey {
-    fn of(l: &Line) -> LineKey {
-        // +0.0 normalises -0.0 so equal floats share a key, as in Python.
-        let b = |v: f64| (v + 0.0).to_bits();
-        LineKey([b(l.x0), b(l.y0), b(l.x1), b(l.y1)], l.text.clone())
+    fn copy_metadata(&self, annot: &mut PdfAnnotation) -> Result<(), Error> {
+        for (key, value) in &self.metadata {
+            annot.object().dict_put(key.as_str(), value.clone())?;
+        }
+        Ok(())
+    }
+
+    fn has_note(&self) -> bool {
+        self.metadata.iter().any(|(key, value)| {
+            matches!(
+                key.as_str(),
+                "Contents" | "RC" | "T" | "Subj" | "CreationDate" | "M"
+            ) && value.as_string().is_ok_and(|s| !s.is_empty())
+        })
     }
 }
 
 struct Job {
-    page: usize,
     para: usize,
-    color: Color,
+    sources: Vec<usize>,
+}
+
+fn quad_rect(q: Quad) -> Rect {
+    let xs = [q.ul.x, q.ur.x, q.ll.x, q.lr.x];
+    let ys = [q.ul.y, q.ur.y, q.ll.y, q.lr.y];
+    Rect {
+        x0: saturate(xs.into_iter().fold(f32::INFINITY, f32::min)),
+        y0: saturate(ys.into_iter().fold(f32::INFINITY, f32::min)),
+        x1: saturate(xs.into_iter().fold(f32::NEG_INFINITY, f32::max)),
+        y1: saturate(ys.into_iter().fold(f32::NEG_INFINITY, f32::max)),
+    }
 }
 
 /// Expand every highlight in `input` to its full paragraph and write the
@@ -348,7 +388,7 @@ pub fn expand_highlights(input: &Path, output: &Path, opts: &Options) -> Result<
     let mut page_paragraphs: Vec<Vec<Paragraph>> = Vec::with_capacity(n_pages);
     for p in 0..n_pages {
         let mut page = doc.load_pdf_page(p as i32)?;
-        let blocks = unrotated(&mut page, |pg| Ok(page_text(pg)?.blocks))?;
+        let blocks = pdf_page_text(&mut page)?.blocks;
         page_paragraphs.push(group_lines_into_paragraphs(&blocks, &opts.params));
     }
 
@@ -364,122 +404,194 @@ pub fn expand_highlights(input: &Path, output: &Path, opts: &Options) -> Result<
         println!("Pages whose first paragraph continues from the previous page: {pages:?}");
     }
 
-    // Phase 3: snapshot and delete the original highlights, plan new ones.
+    // Plan every quad before modifying anything. If any selected region
+    // cannot be matched, preserve the whole original (including its replies).
+    let mut originals = Vec::new();
     let mut work: Vec<Vec<Job>> = (0..n_pages).map(|_| Vec::new()).collect();
     for pno in 0..n_pages {
         let mut page = doc.load_pdf_page(pno as i32)?;
-        let originals = unrotated(&mut page, |pg| {
-            let mut snaps = Vec::new();
-            let mut handles = Vec::new();
+        unrotated(&mut page, |pg| {
             for annot in pg.annotations() {
                 if annot.r#type()? != PdfAnnotationType::Highlight {
                     continue;
                 }
-                let r = annot.bounds()?;
-                snaps.push((
-                    Rect {
+                let mut regions: Vec<_> = annot.quad_points()?.into_iter().map(quad_rect).collect();
+                if regions.is_empty() {
+                    let r = annot.bounds()?;
+                    regions.push(Rect {
                         x0: saturate(r.x0),
                         y0: saturate(r.y0),
                         x1: saturate(r.x1),
                         y1: saturate(r.y1),
-                    },
-                    Color::from_annot(&annot),
-                ));
-                handles.push(annot);
-            }
-            for annot in handles {
-                delete_with_replies(pg, annot)?;
-            }
-            Ok(snaps)
-        })?;
-
-        let paragraphs = &page_paragraphs[pno];
-        if paragraphs.is_empty() {
-            continue;
-        }
-        for (rect, color) in originals {
-            let Some(pidx) = find_paragraph_index(paragraphs, &rect) else {
-                if opts.debug {
-                    println!(
-                        "  WARNING: No paragraph found for highlight on page {} at {:?}",
-                        pno + 1,
-                        rect
-                    );
+                    });
                 }
-                continue;
-            };
-            for (sp, si) in walk_segments(&page_paragraphs, &continues_from_prev, pno, pidx) {
-                work[sp].push(Job {
-                    page: sp,
-                    para: si,
-                    color: color.clone(),
-                });
+                let mut segments = Vec::new();
+                let mut complete = true;
+                for region in &regions {
+                    let matches = find_paragraph_indices(&page_paragraphs[pno], region);
+                    if matches.is_empty() {
+                        complete = false;
+                        break;
+                    }
+                    for idx in matches {
+                        segments.extend(walk_segments(
+                            &page_paragraphs,
+                            &continues_from_prev,
+                            pno,
+                            idx,
+                        ));
+                    }
+                }
+                if !complete {
+                    if opts.debug {
+                        println!("  Kept unmatched highlight on page {}", pno + 1);
+                    }
+                    continue;
+                }
+                let source = originals.len();
+                originals.push(Original::snapshot(pno, &annot)?);
+                for (sp, si) in segments {
+                    if let Some(job) = work[sp].iter_mut().find(|job| job.para == si) {
+                        if !job.sources.contains(&source) {
+                            job.sources.push(source);
+                        }
+                    } else {
+                        work[sp].push(Job {
+                            para: si,
+                            sources: vec![source],
+                        });
+                    }
+                }
             }
-        }
+            Ok(())
+        })?;
     }
 
-    // Phase 5: add the expanded highlights, one per paragraph.
+    let mut reused = HashSet::new();
+    let mut replacements: Vec<Option<PdfObject>> = (0..originals.len()).map(|_| None).collect();
     for (pno, jobs) in work.iter().enumerate() {
         if jobs.is_empty() {
             continue;
         }
         let mut page = doc.load_pdf_page(pno as i32)?;
-        let has_images = page_has_images(&page)?;
-        let blue = opts.blue_on_image && has_images;
-        if opts.debug {
-            println!(
-                "\n=== Page {} ({} paragraphs, images={}, jobs={}) ===",
-                pno + 1,
-                page_paragraphs[pno].len(),
-                if has_images { "yes" } else { "no" },
-                jobs.len()
-            );
-        }
-        let mut seen = HashSet::new();
-        let mut name_counter = 0usize;
-        let mut page_modified = false;
+        let blue = opts.blue_on_image && page_has_images(&page)?;
+        let mut name_counter = 0;
         for job in jobs {
-            let para = &page_paragraphs[job.page][job.para];
-            if !seen.insert(para_key(para)) {
-                continue;
-            }
-            let color: Vec<f32> = if blue {
-                BLUE.to_vec()
-            } else {
-                job.color.components().to_vec()
-            };
-            unrotated(&mut page, |pg| {
-                let name = unique_name(pg, &mut name_counter);
-                let mut annot = pg.add_highlight_annotation(quads_for(para))?;
-                set_color(&mut annot, &color)?;
+            let para = &page_paragraphs[pno][job.para];
+            let local = job
+                .sources
+                .iter()
+                .copied()
+                .filter(|&id| originals[id].page == pno && !reused.contains(&id))
+                // Keep the root when highlights themselves form a reply
+                // thread; retaining a child instead could create a cycle.
+                .min_by_key(|&id| {
+                    originals[id].parent.is_some_and(|parent| {
+                        job.sources
+                            .iter()
+                            .any(|&source| originals[source].xref == parent)
+                    })
+                });
+            let source = local.unwrap_or(job.sources[0]);
+            let original = &originals[source];
+            let object = unrotated(&mut page, |pg| {
+                let mut annot = if local.is_some() {
+                    let annot = pg
+                        .annotations()
+                        .find(|a| a.xref().ok() == Some(original.xref))
+                        .ok_or_else(|| Error::NotPdf("missing source annotation".into()))?;
+                    reused.insert(source);
+                    annot
+                } else {
+                    let mut annot = pg.add_highlight_annotation(quads_for(para))?;
+                    original.copy_metadata(&mut annot)?;
+                    annot
+                };
+                annot.set_quad_points(quads_for(para))?;
+                set_color(
+                    &mut annot,
+                    if blue {
+                        &BLUE
+                    } else {
+                        original.color.components()
+                    },
+                )?;
                 annot.set_opacity(OPACITY)?;
-                let doc = annot
-                    .object()
-                    .document()
-                    .ok_or_else(|| Error::NotPdf("annotation".into()))?;
+                if annot.object().get_dict("NM")?.is_none() {
+                    let name = unique_name(pg, &mut name_counter);
+                    annot.object().dict_put("NM", doc.new_string(&name)?)?;
+                }
                 annot.object().dict_put("BM", doc.new_name("Multiply")?)?;
-                annot.object().dict_put("NM", doc.new_string(&name)?)?;
                 annot.update()?;
                 compress_appearance(&annot)?;
-                Ok(())
+                Ok(annot.object())
             })?;
+            for &source in &job.sources {
+                if originals[source].page == pno && replacements[source].is_none() {
+                    replacements[source] = Some(object.clone());
+                }
+            }
             stats.highlights_expanded += 1;
             if blue {
                 stats.highlights_blued += 1;
             }
-            page_modified = true;
             if opts.debug {
                 println!(
-                    "  Expanded: {} lines covering y={:.1}-{:.1} (color={})",
-                    para.len(),
-                    para[0].y0,
-                    para[para.len() - 1].y1,
-                    if blue { "blue" } else { "original" }
+                    "  Expanded page {} paragraph {} ({} lines)",
+                    pno + 1,
+                    job.para + 1,
+                    para.len()
                 );
             }
         }
-        if page_modified {
-            stats.pages_modified += 1;
+        stats.pages_modified += 1;
+    }
+
+    // A merged-away highlight with authored metadata becomes a text reply.
+    // Preserve each note separately instead of flattening multiple authors
+    // and dates into a single highlight's metadata fields.
+    let mut redirects = HashMap::new();
+    for (id, original) in originals.iter().enumerate() {
+        if reused.contains(&id) {
+            continue;
+        }
+        let mut destination = replacements[id].as_ref().unwrap().clone();
+        if original.has_note() {
+            let mut page = doc.load_pdf_page(original.page as i32)?;
+            destination = unrotated(&mut page, |pg| {
+                let mut note = pg.add_text_annotation(original.rect, "")?;
+                original.copy_metadata(&mut note)?;
+                note.object().dict_put("IRT", destination.clone())?;
+                note.object().dict_put("RT", doc.new_name("R")?)?;
+                let name = unique_name(pg, &mut 0);
+                note.object().dict_put("NM", doc.new_string(&name)?)?;
+                note.update()?;
+                Ok(note.object())
+            })?;
+        }
+        redirects.insert(original.xref, destination);
+    }
+    // Only roots whose identities changed need retargeting. Descendants keep
+    // their existing parent and all levels of the thread remain attached.
+    for pno in 0..n_pages {
+        let mut page = doc.load_pdf_page(pno as i32)?;
+        for annot in page.annotations() {
+            let destination = annot
+                .object()
+                .get_dict("IRT")?
+                .map(|irt| irt.as_indirect())
+                .transpose()?
+                .and_then(|xref| redirects.get(&xref));
+            if let Some(destination) = destination {
+                annot.object().dict_put("IRT", destination.clone())?;
+            }
+        }
+        let removed: Vec<_> = page
+            .annotations()
+            .filter(|a| a.xref().is_ok_and(|xref| redirects.contains_key(&xref)))
+            .collect();
+        for annot in removed {
+            page.delete_annotation(annot)?;
         }
     }
 
@@ -516,8 +628,9 @@ fn save(
             return Ok(());
         }
     }
-    let tmp = format!("{out_str}.tmp");
-    doc.save_with_options(&tmp, full)?;
-    std::fs::rename(&tmp, output)?;
+    // Resolve aliases so a fallback save updates the same target as an
+    // incremental save, without replacing a symlink itself.
+    let target = output.canonicalize()?;
+    save_replacement(doc, &target, full)?;
     Ok(())
 }

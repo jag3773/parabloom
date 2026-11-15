@@ -19,10 +19,10 @@ import sys
 import tempfile
 import time
 
-import fitz
-
 
 def highlights(path):
+    import fitz
+
     doc = fitz.open(path)
     pages = []
     for page in doc:
@@ -78,8 +78,9 @@ def compare(py, rs, tol):
             for k in ("quads", "rect", "color"):
                 if not close(a[k], b[k], tol):
                     diffs.append(f"p{p+1}: {k} differs")
-            if a["ca"] is None or b["ca"] is None or abs(a["ca"] - b["ca"]) > tol:
-                diffs.append(f"p{p+1}: CA {a['ca']} vs {b['ca']}")
+            ca_a, ca_b = a["ca"], b["ca"]
+            if (ca_a != ca_b if ca_a is None or ca_b is None else abs(ca_a - ca_b) > tol):
+                diffs.append(f"p{p+1}: CA {ca_a} vs {ca_b}")
             if a["bm"] != b["bm"]:
                 diffs.append(f"p{p+1}: BM {a['bm']} vs {b['bm']}")
             if a["ap"] != b["ap"] and not getattr(compare, "ignore_ap", False):
@@ -116,6 +117,11 @@ def main():
             src_rs = os.path.join(tmp, "rs-in.pdf")
             out_py = os.path.join(tmp, "py-out.pdf")
             out_rs = os.path.join(tmp, "rs-out.pdf")
+            # Remove outputs between inputs so a successful child that fails
+            # to write cannot accidentally reuse a previous PDF's result.
+            for path in (out_py, out_rs):
+                if os.path.exists(path):
+                    os.unlink(path)
             shutil.copyfile(pdf, src_py)
             shutil.copyfile(pdf, src_rs)
             rp, tp = run([sys.executable, a.ref, src_py, out_py] + extra)
@@ -148,8 +154,10 @@ def main():
             for k in list(r):
                 if isinstance(r[k], bytes):
                     del r[k]
-        json.dump(results, open(a.json, "w"), indent=1)
+        with open(a.json, "w") as output:
+            json.dump(results, output, indent=1)
+    return 0 if ok == len(results) else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

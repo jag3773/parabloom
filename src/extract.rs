@@ -9,6 +9,7 @@
 //! Reference: `JM_make_textpage_dict`, `JM_make_text_block`,
 //! `JM_make_spanlist`, `JM_char_bbox` and `JM_char_quad` in PyMuPDF 1.26.
 
+use mupdf::pdf::PdfPage;
 use mupdf::text_page::{TextBlockType, TextChar, TextCharFlags, TextLine, TextPageFlags};
 use mupdf::{Device, Font, Matrix, Page, Point, Quad, WriteMode};
 
@@ -288,17 +289,17 @@ fn char_quad(ctx: &LineCtx, ch: &TextChar<'_>, font: Option<&Font>) -> Quad {
         q.ul.x = 0.0;
     }
     let cwidth = q.lr.x - q.ll.x;
-    if cwidth < f32::EPSILON {
-        if let Some(cp) = ch.char() {
-            if let Ok(glyph) = font.encode_character(cp as i32) {
-                if glyph != 0 {
-                    if let Ok(fwidth) = font.advance_glyph(glyph) {
-                        q.lr.x = q.ll.x + fwidth * fsize;
-                        q.ur.x = q.lr.x;
-                    }
-                }
-            }
-        }
+    let fallback_width = if cwidth < f32::EPSILON {
+        ch.char()
+            .and_then(|cp| font.encode_character(cp as i32).ok())
+            .filter(|&glyph| glyph != 0)
+            .and_then(|glyph| font.advance_glyph(glyph).ok())
+    } else {
+        None
+    };
+    if let Some(fwidth) = fallback_width {
+        q.lr.x = q.ll.x + fwidth * fsize;
+        q.ur.x = q.lr.x;
     }
     xlate2.apply_quad(trm2.apply_quad(q))
 }
@@ -434,4 +435,23 @@ pub fn page_text(page: &Page) -> Result<PageText, mupdf::Error> {
         });
     }
     Ok(PageText { blocks })
+}
+
+/// Extract PDF text in unrotated page coordinates, restoring the original
+/// rotation even if extraction fails. Use this for PDF callers and tools.
+pub fn pdf_page_text(page: &mut PdfPage) -> Result<PageText, mupdf::Error> {
+    let rotation = page.rotation()?;
+    if rotation == 0 {
+        return page_text(page);
+    }
+    page.set_rotation(0)?;
+    let result = page_text(page);
+    let restored = page.set_rotation(rotation);
+    match result {
+        Err(error) => Err(error),
+        Ok(text) => {
+            restored?;
+            Ok(text)
+        }
+    }
 }
