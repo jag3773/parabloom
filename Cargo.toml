@@ -8,8 +8,9 @@ repository = "https://github.com/jag3773/parabloom"
 readme = "README.md"
 keywords = ["pdf", "highlight", "annotation", "mupdf"]
 categories = ["command-line-utilities"]
-# Repository tooling that the published crate doesn't need.
-exclude = [".github/", "tools/", "RELEASING.md", "rust-toolchain.toml"]
+# Repository tooling and the archived Python reference, which the published
+# crate doesn't need.
+exclude = [".github/", "tools/", "archive/", "RELEASING.md", "rust-toolchain.toml"]
 
 [profile.release]
 strip = true

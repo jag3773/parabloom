@@ -6,7 +6,8 @@ Per highlight it compares /QuadPoints, /Rect, /C, /CA, /BM and the decoded
 appearance stream. Inputs are only read; all writes go to a temp directory.
 
 Usage:
-  python3 tools/parity.py --ref <expand_highlights.py> --bin <parabloom> \
+  python3 tools/parity.py --ref archive/expand_highlights/expand_highlights_patched.py \
+      --bin <parabloom> \
       [--tol 0.001] [--json out.json] [--args "--indent-x 45"] PDF...
 """
 import argparse
