@@ -1,0 +1,16 @@
+# Monthly dependency refresh, equivalent to running `cargo update`.
+# Only Cargo.lock changes: version requirements in Cargo.toml are left as
+# they are, and all updates arrive together in one pull request. Each pull
+# request runs CI and the Release dry run, which builds every platform.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    versioning-strategy: lockfile-only
+    groups:
+      cargo:
+        patterns: ["*"]
+    commit-message:
+      prefix: "cargo"

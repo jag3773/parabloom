@@ -43,6 +43,9 @@ source, and attaching it to the release does that. It builds offline with
    - In `CHANGELOG.md`, rename `## [Unreleased]` to
      `## [X.Y.Z] - YYYY-MM-DD` and add a new, empty `## [Unreleased]` above it.
    - Run `python3 tools/release.py check vX.Y.Z`.
+   - Merge any open Dependabot pull request first, so the release ships
+     current dependencies. Dependabot opens one each month that refreshes
+     `Cargo.lock` (see `.github/dependabot.yml`).
 
    Because the pull request changes `Cargo.toml` and `CHANGELOG.md`, the
    Release workflow does a dry run on it. It builds every binary, the source
