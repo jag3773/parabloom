@@ -19,8 +19,8 @@ use mupdf::{Buffer, Point, Quad, color::AnnotationColor};
 
 use crate::extract::pdf_page_text;
 use crate::layout::{
-    Params, detect_page_continuations, find_paragraph_indices, group_lines_into_paragraphs,
-    walk_segments,
+    Params, detect_page_continuations, drop_page_furniture, find_paragraph_indices,
+    group_lines_into_paragraphs, walk_segments,
 };
 use crate::model::{Paragraph, Rect};
 use crate::save::save_replacement;
@@ -429,7 +429,7 @@ pub fn expand_highlights(input: &Path, output: &Path, opts: &Options) -> Result<
                         y1: saturate(r.y1),
                     });
                 }
-                let mut segments = Vec::new();
+                let mut matched: Vec<usize> = Vec::new();
                 let mut complete = true;
                 for region in &regions {
                     let matches = find_paragraph_indices(&page_paragraphs[pno], region);
@@ -438,12 +438,9 @@ pub fn expand_highlights(input: &Path, output: &Path, opts: &Options) -> Result<
                         break;
                     }
                     for idx in matches {
-                        segments.extend(walk_segments(
-                            &page_paragraphs,
-                            &continues_from_prev,
-                            pno,
-                            idx,
-                        ));
+                        if !matched.contains(&idx) {
+                            matched.push(idx);
+                        }
                     }
                 }
                 if !complete {
@@ -451,6 +448,16 @@ pub fn expand_highlights(input: &Path, output: &Path, opts: &Options) -> Result<
                         println!("  Kept unmatched highlight on page {}", pno + 1);
                     }
                     continue;
+                }
+                drop_page_furniture(&page_paragraphs[pno], &mut matched);
+                let mut segments = Vec::new();
+                for idx in matched {
+                    segments.extend(walk_segments(
+                        &page_paragraphs,
+                        &continues_from_prev,
+                        pno,
+                        idx,
+                    ));
                 }
                 let source = originals.len();
                 originals.push(Original::snapshot(pno, &annot)?);
