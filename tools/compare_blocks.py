@@ -6,6 +6,7 @@ Usage: python3 tools/compare_blocks.py <python.json> <rust.json> [--tol 0.01] [-
 import argparse
 import json
 import math
+import sys
 
 
 def coord_diff(a, b):
@@ -29,13 +30,14 @@ def main():
 
     py = json.load(open(a.py))
     rs = json.load(open(a.rs))
-    stats = dict(pages=0, pages_same=0, block_count_diff=0, line_count_diff=0,
+    stats = dict(pages=max(len(py), len(rs)), pages_same=0,
+                 page_count_diff=abs(len(py) - len(rs)),
+                 block_count_diff=0, block_bbox_diff=0, line_count_diff=0,
                  bbox_diff=0, text_diff=0, lines=0)
     shown = 0
     if len(py) != len(rs):
         print(f"PAGE COUNT DIFFERS: py={len(py)} rs={len(rs)}")
     for p, (pb, rb) in enumerate(zip(py, rs)):
-        stats["pages"] += 1
         same = True
         if len(pb) != len(rb):
             stats["block_count_diff"] += 1
@@ -44,6 +46,13 @@ def main():
                 print(f"p{p+1}: blocks py={len(pb)} rs={len(rb)}")
                 shown += 1
         for bi, (b1, b2) in enumerate(zip(pb, rb)):
+            d = max(coord_diff(x, y) for x, y in zip(b1["bbox"], b2["bbox"]))
+            if len(b1["bbox"]) != len(b2["bbox"]) or d > a.tol:
+                stats["block_bbox_diff"] += 1
+                same = False
+                if shown < a.show:
+                    print(f"p{p+1} b{bi}: block bbox differs: {b1['bbox']} vs {b2['bbox']}")
+                    shown += 1
             if len(b1["lines"]) != len(b2["lines"]):
                 stats["line_count_diff"] += 1
                 same = False
@@ -69,7 +78,8 @@ def main():
         if same:
             stats["pages_same"] += 1
     print(json.dumps(stats))
+    return 0 if stats["pages_same"] == stats["pages"] else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
