@@ -13,7 +13,8 @@ Two modes:
       resulting highlight annotations per page as JSON.
 
 <ref.py> is the reference implementation, normally the 2026-08-03 patched
-expand_highlights.py. It is imported, never modified.
+script at archive/expand_highlights/expand_highlights_patched.py. It is
+imported, never modified.
 """
 import argparse
 import importlib.util

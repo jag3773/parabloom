@@ -48,7 +48,7 @@ Historical results for the initial port, before the safety and layout correction
 | End to end, 381 PDFs | 348 identical; 33 differ on 91 pages in total |
 | Time, 381 PDFs | Python 594 s, Parabloom 128 s |
 
-On each of the 91 differing pages, MuPDF 1.27 extracted different blocks than 1.26 on that page or a neighbour. At that time, no difference traced to the port itself. These measurements have not been rerun for the current implementation; the reference script and private corpus are not distributed with this repository.
+On each of the 91 differing pages, MuPDF 1.27 extracted different blocks than 1.26 on that page or a neighbour. At that time, no difference traced to the port itself. These measurements have not been rerun for the current implementation. The private corpus is not distributed; the reference script is archived in [`archive/expand_highlights/`](archive/expand_highlights/).
 
 ### Known differences
 
