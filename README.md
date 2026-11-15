@@ -60,7 +60,11 @@ On each of the 91 differing pages, MuPDF 1.27 extracted different blocks than 1.
 
 ## Installing
 
-Each [GitHub release](https://github.com/jag3773/parabloom/releases) has prebuilt binaries for Linux and macOS (x86_64 and arm64), a source archive with all dependencies vendored, and SHA-256 checksums. `RELEASING.md` describes what each release contains and how one is made. To build it yourself, see below.
+```bash
+cargo install parabloom --locked
+```
+
+This builds from source, so it needs the same toolchain as [Building](#building). Each [GitHub release](https://github.com/jag3773/parabloom/releases) also has prebuilt binaries for Linux and macOS (x86_64 and arm64), a source archive with all dependencies vendored, and SHA-256 checksums. `RELEASING.md` describes what each release contains and how one is made. To build it yourself, see below.
 
 ## Building
 

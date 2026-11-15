@@ -2,7 +2,8 @@
 
 A release is a `vMAJOR.MINOR.PATCH` tag on `main`. Pushing the tag runs
 `.github/workflows/release.yml`, which checks the release, runs the full CI
-suite, builds the binaries, and publishes a GitHub release. Nobody builds or
+suite, builds the binaries, publishes a GitHub release, and then publishes the
+crate to [crates.io](https://crates.io/crates/parabloom). Nobody builds or
 uploads release files by hand.
 
 ## What a release contains
@@ -19,6 +20,9 @@ uploads release files by hand.
 Each binary archive holds `parabloom`, `README.md`, `LICENSE` and
 `CHANGELOG.md`. The archives also get a GitHub build-provenance attestation,
 which `gh attestation verify` checks.
+
+The same version is published to crates.io, so `cargo install parabloom
+--locked` works. That builds MuPDF from source on the user's machine.
 
 The source archive is there because the binaries statically link MuPDF,
 which is AGPL-3.0. Whoever distributes a binary must offer the corresponding
@@ -40,8 +44,9 @@ source, and attaching it to the release does that. It builds offline with
    - Run `python3 tools/release.py check vX.Y.Z`.
 
    Because the pull request changes `Cargo.toml` and `CHANGELOG.md`, the
-   Release workflow does a dry run on it. It builds every binary and the
-   source archive but does not publish. Wait for it to pass.
+   Release workflow does a dry run on it. It builds every binary, the source
+   archive and the crate package (`cargo publish --dry-run`) but publishes
+   nothing. Wait for it to pass.
 
 3. **Merge** the pull request.
 
@@ -56,7 +61,7 @@ source, and attaching it to the release does that. It builds offline with
 
 5. **Watch the Release workflow** under the repository's Actions tab. When it
    finishes, the release appears under Releases, with notes taken from the
-   changelog section.
+   changelog section, and the version appears on crates.io.
 
 The first release is `0.1.0`. `Cargo.toml` already says `0.1.0`, so that
 release pull request only needs the changelog rename.
@@ -74,9 +79,17 @@ release pull request only needs the changelog rename.
 
   Then repeat step 4.
 
+- **Only the crates.io job fails.** The GitHub release is already out. Fix the
+  cause (an expired token, for example), then re-run just that failed job from
+  the workflow run page. If the version already reached crates.io, the job
+  skips the upload.
+
 - **A published release is broken.** Don't move or reuse the tag, since people
   may already have downloaded it. Mark the GitHub release as a pre-release or
-  edit its notes to warn people, then ship a patch release.
+  edit its notes to warn people, and
+  [yank](https://doc.rust-lang.org/cargo/commands/cargo-yank.html) the
+  crates.io version (`cargo yank --version X.Y.Z parabloom`). A crates.io
+  version can't be deleted or re-uploaded. Then ship a patch release.
 
 ## What the workflow checks before building
 
@@ -86,8 +99,15 @@ release pull request only needs the changelog rename.
 - The tagged commit is on `main`.
 - The CI suite passes: formatting, clippy, Rust tests and Python tool tests.
 - Each binary reports the expected version from `parabloom --version`.
+- The crate packages and builds from its package (`cargo publish --dry-run`).
 
-## Recommended repository setting
+## Repository settings
 
-Add a tag ruleset (Settings → Rules → Rulesets) that restricts who can create
-or delete `v*` tags. Anyone who can push such a tag can publish a release.
+- **crates.io token.** The crates.io job reads `CARGO_REGISTRY_TOKEN` from the
+  `Crates Publishing` deployment environment (Settings → Environments). If that
+  environment limits deployments to certain branches or tags, it must allow
+  `v*` tags, because the job runs on the tag. Scope the token on crates.io to
+  publishing `parabloom` only, and replace it before it expires.
+- **Tag ruleset.** Add a tag ruleset (Settings → Rules → Rulesets) that
+  restricts who can create or delete `v*` tags. Anyone who can push such a tag
+  can publish a release.

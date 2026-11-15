@@ -13,4 +13,4 @@ release is cut.
 - In-place updates when the input and output paths match, using an incremental save with a staged, permission-preserving full-rewrite fallback.
 - Preservation of annotation notes, authors, dates and reply threads when highlights are expanded or merged.
 - Column-aware paragraph grouping, matching of every selected quad, and rotation-safe text extraction.
-- Prebuilt binaries for Linux and macOS (x86_64 and arm64), a vendored source archive and SHA-256 checksums on each GitHub release.
+- Prebuilt binaries for Linux and macOS (x86_64 and arm64), a vendored source archive and SHA-256 checksums on each GitHub release, and publishing to crates.io.

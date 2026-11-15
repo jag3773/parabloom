@@ -8,6 +8,8 @@ repository = "https://github.com/jag3773/parabloom"
 readme = "README.md"
 keywords = ["pdf", "highlight", "annotation", "mupdf"]
 categories = ["command-line-utilities"]
+# Repository tooling that the published crate doesn't need.
+exclude = [".github/", "tools/", "RELEASING.md", "rust-toolchain.toml"]
 
 [profile.release]
 strip = true
@@ -18,4 +20,7 @@ clap = { version = "4.6.7", features = ["derive"] }
 flate2 = "1.1.11"
 mupdf = { version = "0.8.0", default-features = false, features = ["base14-fonts"] }
 serde = { version = "1.0.229", features = ["derive"] }
+
+[dev-dependencies]
+# Used by the examples only.
 serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
