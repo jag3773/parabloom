@@ -321,6 +321,7 @@ impl Original {
                     | "Popup"
                     | "IRT"
                     | "RT"
+                    | "StructParent"
             ) {
                 metadata.push((key, object.get_dict_val(i)?.unwrap()));
             }
@@ -345,12 +346,15 @@ impl Original {
         Ok(())
     }
 
+    /// Whether the highlight carries authored note text. Author, subject and
+    /// date fields alone are not notes: most viewers write them on every
+    /// highlight, so treating them as notes would turn each merged highlight
+    /// into an empty sticky note. They are still copied when a note exists.
     fn has_note(&self) -> bool {
         self.metadata.iter().any(|(key, value)| {
-            matches!(
-                key.as_str(),
-                "Contents" | "RC" | "T" | "Subj" | "CreationDate" | "M"
-            ) && value.as_string().is_ok_and(|s| !s.is_empty())
+            matches!(key.as_str(), "Contents" | "RC")
+                && (value.is_stream().unwrap_or(false)
+                    || value.as_string().is_ok_and(|s| !s.trim().is_empty()))
         })
     }
 }

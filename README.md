@@ -20,7 +20,7 @@ Pass the same path twice to overwrite in place. Parabloom then saves incremental
 | `--no-blue-on-image` | off | Keep original colours on pages with images. By default those highlights turn blue (0.2, 0.4, 0.8). |
 | `--debug` | off | Print page continuations and each expanded paragraph. |
 
-Each expanded highlight keeps the original's colour (unless image-page recoloring applies) and uses 0.4 opacity with Multiply blending. Highlights covering the same paragraph collapse to one. Original notes, authors, dates and reply threads are preserved; notes from merged highlights become separate text replies. Highlights with any selected region that cannot be matched to text remain unchanged, including highlights on scanned pages and excluded footnotes.
+Each expanded highlight keeps the original's colour (unless image-page recoloring applies) and uses 0.4 opacity with Multiply blending. Highlights covering the same paragraph collapse to one. Original notes, authors, dates and reply threads are preserved; note text from merged highlights becomes a separate text reply with its author and dates, while merged highlights without note text add no reply. Highlights with any selected region that cannot be matched to text remain unchanged, including highlights on scanned pages and excluded footnotes.
 
 ## How it works
 

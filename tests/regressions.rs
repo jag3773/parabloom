@@ -448,6 +448,35 @@ fn merging_highlight_replies_retains_the_thread_root() {
 }
 
 #[test]
+fn merged_highlights_with_only_author_and_dates_add_no_notes() {
+    let fixture = Fixture::new();
+    let doc = PdfDocument::from_bytes(&one_page(BODY, "", vec![])).unwrap();
+    {
+        let mut page = doc.load_pdf_page(0).unwrap();
+        // Viewers typically write an author and dates on every highlight.
+        for x in [100.0, 150.0, 200.0] {
+            let mut h = page.add_highlight_annotation(q(x, 81.0)).unwrap();
+            h.set_author("Reader").unwrap();
+            h.object()
+                .dict_put("CreationDate", doc.new_string("D:20260101000000Z").unwrap())
+                .unwrap();
+            h.object()
+                .dict_put("M", doc.new_string("D:20260102000000Z").unwrap())
+                .unwrap();
+            h.update().unwrap();
+        }
+    }
+    let source = fixture.path("metadata-only.pdf");
+    doc.save(source.to_str().unwrap()).unwrap();
+    let out = fixture.expand(&source);
+    let page = out.load_pdf_page(0).unwrap();
+    let annots: Vec<_> = page.annotations().collect();
+    assert_eq!(annots.len(), 1);
+    assert_eq!(annots[0].r#type().unwrap(), PdfAnnotationType::Highlight);
+    assert_eq!(annots[0].author().unwrap(), Some("Reader"));
+}
+
+#[test]
 fn partially_unmatched_selection_is_kept_whole() {
     let fixture = Fixture::new();
     let quads = vec![q(100.0, 81.0), q(100.0, 740.0)];
