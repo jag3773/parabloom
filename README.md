@@ -2,7 +2,7 @@
 
 Parabloom expands partial PDF highlights so each one covers the whole paragraph it sits in. Highlight a few words while you read, run Parabloom, and every marked paragraph comes back fully highlighted, ready for annotation extraction.
 
-It is a single binary with no runtime dependencies, a Rust port of the `expand_highlights.py` script (PyMuPDF), and it produces the same highlights.
+It is a single binary with no runtime dependencies, a Rust port of the `expand_highlights.py` script (PyMuPDF). It produces the same highlights, apart from the deliberate differences listed below.
 
 ## Usage
 
@@ -20,7 +20,7 @@ Pass the same path twice to overwrite in place. Parabloom then saves incremental
 | `--no-blue-on-image` | off | Keep original colours on pages with images. By default those highlights turn blue (0.2, 0.4, 0.8). |
 | `--debug` | off | Print page continuations and each expanded paragraph. |
 
-Each expanded highlight keeps the original's colour, uses 0.4 opacity with Multiply blending, and replaces every highlight that pointed into the same paragraph.
+Each expanded highlight keeps the original's colour and uses 0.4 opacity with Multiply blending. A highlight that spans several paragraphs grows to cover all of them, still as one highlight. A paragraph already covered by an earlier highlight is not covered twice.
 
 ## How it works
 
@@ -29,7 +29,7 @@ PDFs store positioned characters, not paragraphs. Parabloom rebuilds paragraphs 
 1. **Extract.** MuPDF segments each page into text blocks and lines. Parabloom rebuilds each line box from its character boxes, as PyMuPDF does, so the numbers match.
 2. **Group.** Multi-line blocks stay as MuPDF segmented them. Single-line blocks merge by indent and vertical gap. A block that looks like a split of the open paragraph (normal line gap, flush left or centred with it, sentence still running) merges into it.
 3. **Bridge pages.** A paragraph continues onto the next page when that page starts flush left and the previous page ended mid-sentence, at the right margin, or the next line starts lowercase. A lone centred or all-caps last line counts as an attribution and blocks the bridge.
-4. **Replace.** Each original highlight is matched to the paragraph containing its vertical centre, deleted with any reply annotations, and replaced by one highlight per paragraph segment.
+4. **Replace.** Each line of an original highlight is matched to the paragraph that contains it, preferring a paragraph in the same column. The original is deleted with any reply annotations and replaced by one highlight per page, covering every paragraph it touched. Blank paragraphs, and a page number swept up by a long selection, are left out.
 
 ## Parity with the Python script
 
@@ -55,6 +55,7 @@ On each of the 91 differing pages, MuPDF 1.27 extracted different blocks than 1.
 - **MuPDF version.** The `mupdf` crate bundles MuPDF 1.27.2; PyMuPDF 1.26.5 ships 1.26.10. On a small share of pages 1.27 groups lines into blocks differently, which can change how far a highlight reaches.
 - **Appearance stream bytes.** Both draw the same paths in the same colour and graphics state. PyMuPDF wraps its stream in an extra `q … Q` and repeats `/H gs`.
 - **`/NM` names** read `parabloom-A0` instead of `fitz-A0`.
+- **Highlights across paragraphs.** The Python script matches each highlight to the single paragraph at its vertical centre, so a highlight dragged over several paragraphs shrinks to one of them. Parabloom matches line by line and keeps every paragraph the highlight touched. This is a deliberate change: on the test library it changes about 3,600 pages, nearly all by restoring paragraphs Python dropped.
 - **Rotated pages** follow PyMuPDF's approach (work with `/Rotate` set to 0, then restore it) but no rotated page in the test corpus carried a highlight, so this path is untested against real files.
 
 ## Building

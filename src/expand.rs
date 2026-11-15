@@ -20,7 +20,7 @@ use mupdf::{Buffer, Point, Quad, color::AnnotationColor};
 
 use crate::extract::page_text;
 use crate::layout::{
-    Params, detect_page_continuations, find_paragraph_index, group_lines_into_paragraphs,
+    Params, detect_page_continuations, find_paragraph_indices, group_lines_into_paragraphs,
     walk_segments,
 };
 use crate::model::{Line, Paragraph, Rect};
@@ -325,9 +325,10 @@ impl LineKey {
     }
 }
 
+/// One new highlight to draw: the paragraphs (indices into the page's list)
+/// that one original highlight reaches on one page.
 struct Job {
-    page: usize,
-    para: usize,
+    paras: Vec<usize>,
     color: Color,
 }
 
@@ -376,6 +377,29 @@ pub fn expand_highlights(input: &Path, output: &Path, opts: &Options) -> Result<
                     continue;
                 }
                 let r = annot.bounds()?;
+                // Box of each highlighted line. A corrupt or missing
+                // /QuadPoints array leaves this empty, and matching falls
+                // back to the rectangle.
+                let lines: Vec<Rect> = annot
+                    .quad_points()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|q| {
+                        let xs = [q.ul.x, q.ur.x, q.ll.x, q.lr.x].map(saturate);
+                        let ys = [q.ul.y, q.ur.y, q.ll.y, q.lr.y].map(saturate);
+                        let lo = |v: [f64; 4]| v.iter().copied().fold(f64::INFINITY, f64::min);
+                        let hi = |v: [f64; 4]| v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                        Rect {
+                            x0: lo(xs),
+                            y0: lo(ys),
+                            x1: hi(xs),
+                            y1: hi(ys),
+                        }
+                    })
+                    .filter(|r| {
+                        r.x0.is_finite() && r.y0.is_finite() && r.x1.is_finite() && r.y1.is_finite()
+                    })
+                    .collect();
                 snaps.push((
                     Rect {
                         x0: saturate(r.x0),
@@ -383,6 +407,7 @@ pub fn expand_highlights(input: &Path, output: &Path, opts: &Options) -> Result<
                         x1: saturate(r.x1),
                         y1: saturate(r.y1),
                     },
+                    lines,
                     Color::from_annot(&annot),
                 ));
                 handles.push(annot);
@@ -397,28 +422,39 @@ pub fn expand_highlights(input: &Path, output: &Path, opts: &Options) -> Result<
         if paragraphs.is_empty() {
             continue;
         }
-        for (rect, color) in originals {
-            let Some(pidx) = find_paragraph_index(paragraphs, &rect) else {
-                if opts.debug {
-                    println!(
-                        "  WARNING: No paragraph found for highlight on page {} at {:?}",
-                        pno + 1,
-                        rect
-                    );
+        for (rect, lines, color) in originals {
+            let hits = find_paragraph_indices(paragraphs, &rect, &lines);
+            if hits.is_empty() && opts.debug {
+                println!(
+                    "  WARNING: No paragraph found for highlight on page {} at {:?}",
+                    pno + 1,
+                    rect
+                );
+            }
+            // Group the paragraphs this highlight reaches by page, in the
+            // order pages are first reached, so each page gets one new
+            // highlight per original.
+            let mut by_page: Vec<(usize, Vec<usize>)> = Vec::new();
+            for pidx in hits {
+                for (sp, si) in walk_segments(&page_paragraphs, &continues_from_prev, pno, pidx) {
+                    match by_page.iter_mut().find(|(p, _)| *p == sp) {
+                        Some((_, paras)) if paras.contains(&si) => {}
+                        Some((_, paras)) => paras.push(si),
+                        None => by_page.push((sp, vec![si])),
+                    }
                 }
-                continue;
-            };
-            for (sp, si) in walk_segments(&page_paragraphs, &continues_from_prev, pno, pidx) {
+            }
+            for (sp, paras) in by_page {
                 work[sp].push(Job {
-                    page: sp,
-                    para: si,
+                    paras,
                     color: color.clone(),
                 });
             }
         }
     }
 
-    // Phase 5: add the expanded highlights, one per paragraph.
+    // Phase 5: add the expanded highlights, one per original highlight and
+    // page, each covering whole paragraphs.
     for (pno, jobs) in work.iter().enumerate() {
         if jobs.is_empty() {
             continue;
@@ -439,10 +475,23 @@ pub fn expand_highlights(input: &Path, output: &Path, opts: &Options) -> Result<
         let mut name_counter = 0usize;
         let mut page_modified = false;
         for job in jobs {
-            let para = &page_paragraphs[job.page][job.para];
-            if !seen.insert(para_key(para)) {
+            // A paragraph already covered by an earlier highlight is skipped,
+            // as the reference does; the rest are drawn in reading order.
+            let mut paras: Vec<usize> = job
+                .paras
+                .iter()
+                .copied()
+                .filter(|&i| seen.insert(para_key(&page_paragraphs[pno][i])))
+                .collect();
+            if paras.is_empty() {
                 continue;
             }
+            paras.sort_unstable();
+            let lines: Paragraph = paras
+                .iter()
+                .flat_map(|&i| page_paragraphs[pno][i].iter().cloned())
+                .collect();
+            let para = &lines;
             let color: Vec<f32> = if blue {
                 BLUE.to_vec()
             } else {

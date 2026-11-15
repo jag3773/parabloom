@@ -1,6 +1,6 @@
 //! End-to-end test on a generated PDF: a partial highlight on one word must
 //! grow to cover its whole paragraph, keep its colour, and leave the next
-//! paragraph alone.
+//! paragraph alone, and a highlight spanning paragraphs must cover each.
 
 use std::path::PathBuf;
 
@@ -160,4 +160,67 @@ fn overwrite_in_place_keeps_one_highlight_per_paragraph() {
         .filter(|a| a.r#type().unwrap() == PdfAnnotationType::Highlight)
         .count();
     assert_eq!(n, 1);
+}
+
+#[test]
+fn highlight_across_two_paragraphs_expands_to_both() {
+    // One highlight dragged from paragraph one's first line to paragraph
+    // two's first line: its rectangle's centre falls between them, but each
+    // line it marks belongs to a paragraph, so both paragraphs are covered.
+    let input = temp_path("across-in.pdf");
+    let output = temp_path("across-out.pdf");
+    let doc = PdfDocument::from_bytes(&sample_pdf()).unwrap();
+    {
+        let mut page = doc.load_pdf_page(0).unwrap();
+        let line = |x0: f32, x1: f32, top: f32| {
+            Quad::new(
+                Point { x: x0, y: top },
+                Point { x: x1, y: top },
+                Point {
+                    x: x0,
+                    y: top + 13.0,
+                },
+                Point {
+                    x: x1,
+                    y: top + 13.0,
+                },
+            )
+        };
+        let quads = vec![
+            line(140.0, 360.0, 81.0),
+            line(72.0, 360.0, 95.0),
+            line(72.0, 200.0, 109.0),
+            line(90.0, 300.0, 133.0),
+        ];
+        page.add_highlight_annotation(quads)
+            .unwrap()
+            .update()
+            .unwrap();
+    }
+    doc.save(input.to_str().unwrap()).unwrap();
+
+    let stats = expand_highlights(&input, &output, &Options::default()).unwrap();
+    assert_eq!(
+        stats.highlights_expanded, 1,
+        "one original, one replacement"
+    );
+
+    let out = PdfDocument::open(output.to_str().unwrap()).unwrap();
+    let page = out.load_pdf_page(0).unwrap();
+    let quads: Vec<Vec<Quad>> = page
+        .annotations()
+        .filter(|a| a.r#type().unwrap() == PdfAnnotationType::Highlight)
+        .map(|a| a.quad_points().unwrap())
+        .collect();
+    assert_eq!(quads.len(), 1);
+    assert_eq!(
+        quads[0].len(),
+        5,
+        "all three lines of paragraph one and both of paragraph two"
+    );
+    let tops: Vec<f32> = quads[0].iter().map(|q| q.ul.y).collect();
+    assert!(
+        tops.windows(2).all(|w| w[0] < w[1]),
+        "quads in reading order: {tops:?}"
+    );
 }

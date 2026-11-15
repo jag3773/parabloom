@@ -284,6 +284,67 @@ pub fn find_paragraph_index(paragraphs: &[Paragraph], rect: &Rect) -> Option<usi
     best
 }
 
+/// True for text that is only a page number: up to six digits or lowercase roman
+/// numerals, ignoring surrounding whitespace.
+fn is_page_number(text: &str) -> bool {
+    let t = py_rstrip(py_lstrip(text));
+    !t.is_empty()
+        && t.chars().count() <= 6
+        && (t.chars().all(|c| c.is_ascii_digit()) || t.chars().all(|c| "ivxlcdm".contains(c)))
+}
+
+/// Every paragraph a highlight touches, matched line by line.
+///
+/// `lines` holds the bounding box of each of the highlight's quads (one per
+/// highlighted line). Each line picks the paragraph that contains its
+/// vertical centre, preferring an exact hit over one within the 3pt
+/// tolerance, and among those a paragraph that overlaps the line
+/// horizontally, so a line in one column never lands in the paragraph beside
+/// it. A highlight dragged across several paragraphs therefore covers all of
+/// them. Indices come back in quad order without repeats. When no line lands
+/// in a paragraph (no quads, or every centre falls in a gap), this falls back
+/// to [`find_paragraph_index`] on the whole rectangle, the reference
+/// behaviour.
+pub fn find_paragraph_indices(paragraphs: &[Paragraph], rect: &Rect, lines: &[Rect]) -> Vec<usize> {
+    let pick = |q: &Rect, tol: f64| -> Option<usize> {
+        let hy = (q.y0 + q.y1) / 2.0;
+        let mut first = None;
+        for (i, p) in paragraphs.iter().enumerate() {
+            let (y0, y1) = (p[0].y0, p[p.len() - 1].y1);
+            if !(y0 - tol <= hy && hy <= y1 + tol) {
+                continue;
+            }
+            let px0 = py_min(p.iter().map(|l| l.x0)).unwrap_or(f64::INFINITY);
+            let px1 = py_max(p.iter().map(|l| l.x1)).unwrap_or(f64::NEG_INFINITY);
+            if q.x0 < px1 && px0 < q.x1 {
+                return Some(i);
+            }
+            first.get_or_insert(i);
+        }
+        first
+    };
+    let mut out: Vec<usize> = Vec::new();
+    for q in lines {
+        if let Some(i) = pick(q, 0.0).or_else(|| pick(q, 3.0)) {
+            if !out.contains(&i) {
+                out.push(i);
+            }
+        }
+    }
+    // A selection dragged down a page can catch blank lines and the page
+    // number. Drop blank paragraphs, and number-only ones when the highlight
+    // also reaches real text.
+    let text = |i: usize| -> String { paragraphs[i].iter().map(|l| l.text.as_str()).collect() };
+    out.retain(|&i| !text(i).chars().all(py_isspace));
+    if out.iter().any(|&i| !is_page_number(&text(i))) {
+        out.retain(|&i| !is_page_number(&text(i)));
+    }
+    if out.is_empty() {
+        out.extend(find_paragraph_index(paragraphs, rect));
+    }
+    out
+}
+
 /// For each page, whether its first paragraph continues the last paragraph
 /// of the previous page (`detect_page_continuations`, patched).
 pub fn detect_page_continuations(page_paragraphs: &[Vec<Paragraph>]) -> Vec<bool> {
@@ -487,6 +548,121 @@ mod tests {
         assert_eq!(find_paragraph_index(&paras, &r(201.0, 211.0)), Some(1));
         assert_eq!(find_paragraph_index(&paras, &r(170.0, 180.0)), Some(1));
         assert_eq!(find_paragraph_index(&[], &r(1.0, 2.0)), None);
+    }
+
+    #[test]
+    fn multi_paragraph_highlight_covers_each_paragraph() {
+        // Highlighted lines as boxes across the column, centred on `y`.
+        let at = |ys: &[f64]| -> Vec<Rect> {
+            ys.iter()
+                .map(|&y| Rect {
+                    x0: 72.0,
+                    y0: y - 5.0,
+                    x1: 300.0,
+                    y1: y + 5.0,
+                })
+                .collect()
+        };
+        let paras = vec![
+            vec![
+                line(72.0, 100.0, 540.0, 112.0, "a text"),
+                line(72.0, 114.0, 540.0, 126.0, "b text"),
+            ],
+            vec![line(72.0, 140.0, 540.0, 152.0, "c text")],
+            vec![line(72.0, 200.0, 540.0, 212.0, "d text")],
+        ];
+        // Whole-page highlight: its rectangle's centre (156) sits in a gap.
+        let big = Rect {
+            x0: 72.0,
+            y0: 100.0,
+            x1: 540.0,
+            y1: 212.0,
+        };
+        assert_eq!(
+            find_paragraph_indices(&paras, &big, &at(&[106.0, 120.0, 146.0, 206.0])),
+            vec![0, 1, 2]
+        );
+        // Several lines of one paragraph give that paragraph once.
+        assert_eq!(
+            find_paragraph_indices(&paras, &big, &at(&[106.0, 120.0])),
+            vec![0]
+        );
+        // An exact hit beats a neighbour within the 3pt tolerance.
+        let tight = vec![
+            vec![line(72.0, 100.0, 540.0, 126.0, "a text")],
+            vec![line(72.0, 127.0, 540.0, 139.0, "b text")],
+        ];
+        assert_eq!(find_paragraph_indices(&tight, &big, &at(&[128.0])), vec![1]);
+        // Within tolerance of a paragraph but in no paragraph: still matched.
+        assert_eq!(find_paragraph_indices(&paras, &big, &at(&[128.5])), vec![0]);
+        // No quads, or only gaps: fall back to the rectangle's centre.
+        let small = Rect {
+            x0: 80.0,
+            y0: 201.0,
+            x1: 120.0,
+            y1: 211.0,
+        };
+        assert_eq!(find_paragraph_indices(&paras, &small, &[]), vec![2]);
+        assert_eq!(
+            find_paragraph_indices(&paras, &small, &at(&[175.0])),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn highlighted_line_matches_its_own_column() {
+        // A sidebar (x 40-160) beside a main-column paragraph (x 200-540),
+        // both spanning the same heights.
+        let paras = vec![
+            vec![
+                line(200.0, 100.0, 540.0, 112.0, "main one"),
+                line(200.0, 114.0, 540.0, 126.0, "main two"),
+            ],
+            vec![
+                line(40.0, 100.0, 160.0, 112.0, "side one"),
+                line(40.0, 114.0, 160.0, 126.0, "side two"),
+            ],
+        ];
+        let r = |x0, x1| Rect {
+            x0,
+            y0: 114.0,
+            x1,
+            y1: 126.0,
+        };
+        assert_eq!(
+            find_paragraph_indices(&paras, &r(40.0, 120.0), &[r(40.0, 120.0)]),
+            vec![1]
+        );
+        assert_eq!(
+            find_paragraph_indices(&paras, &r(220.0, 400.0), &[r(220.0, 400.0)]),
+            vec![0]
+        );
+        // Blank lines and a page number caught by a long selection are
+        // dropped; a highlight on the page number alone still keeps it.
+        let page = vec![
+            vec![line(72.0, 100.0, 540.0, 112.0, "body text")],
+            vec![line(72.0, 120.0, 540.0, 132.0, " ")],
+            vec![line(300.0, 700.0, 312.0, 712.0, "26")],
+        ];
+        let at = |y: f64| Rect {
+            x0: 72.0,
+            y0: y - 5.0,
+            x1: 540.0,
+            y1: y + 5.0,
+        };
+        assert_eq!(
+            find_paragraph_indices(&page, &at(400.0), &[at(106.0), at(126.0), at(706.0)]),
+            vec![0]
+        );
+        assert_eq!(
+            find_paragraph_indices(&page, &at(706.0), &[at(706.0)]),
+            vec![2]
+        );
+        // With no horizontal overlap anywhere, the first vertical match wins.
+        assert_eq!(
+            find_paragraph_indices(&paras, &r(560.0, 600.0), &[r(560.0, 600.0)]),
+            vec![0]
+        );
     }
 
     #[test]
