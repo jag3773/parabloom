@@ -1,10 +1,11 @@
 # Releasing Parabloom
 
-A release is a `vMAJOR.MINOR.PATCH` tag on `main`. Pushing the tag runs
-`.github/workflows/release.yml`, which checks the release, runs the full CI
-suite, builds the binaries, publishes a GitHub release, and then publishes the
-crate to [crates.io](https://crates.io/crates/parabloom). Nobody builds or
-uploads release files by hand.
+A release is a `vMAJOR.MINOR.PATCH` tag on `main`. You start one from the
+Actions tab, with no git commands, or by pushing the tag yourself. Either way
+`.github/workflows/release.yml` checks the release, runs the full CI suite,
+builds the binaries, publishes a GitHub release, and then publishes the crate
+to [crates.io](https://crates.io/crates/parabloom). Nobody builds or uploads
+release files by hand.
 
 ## What a release contains
 
@@ -50,7 +51,13 @@ source, and attaching it to the release does that. It builds offline with
 
 3. **Merge** the pull request.
 
-4. **Tag the merge commit and push the tag:**
+4. **Start the release** from the Actions tab: choose **Release**, then
+   **Run workflow**, leave the branch as `main`, enter the version (`X.Y.Z`,
+   without the `v`), and run it. The workflow releases the latest commit on
+   `main`. It creates the `vX.Y.Z` tag itself, only after every build has
+   passed.
+
+   If you prefer git, pushing the tag does the same thing:
 
    ```bash
    git switch main
@@ -63,21 +70,17 @@ source, and attaching it to the release does that. It builds offline with
    finishes, the release appears under Releases, with notes taken from the
    changelog section, and the version appears on crates.io.
 
-The first release is `0.1.0`. `Cargo.toml` already says `0.1.0`, so that
-release pull request only needs the changelog rename.
-
 ## When something goes wrong
 
 - **The workflow fails before publishing.** Nothing has been released. Fix the
-  problem on `main` through a pull request. Then delete the tag and tag the
-  new commit:
+  problem on `main` through a pull request, then repeat step 4. A run started
+  from the Actions tab creates no tag until the builds pass, so there is
+  nothing to clean up. If you pushed the tag yourself, delete it first:
 
   ```bash
   git push --delete origin vX.Y.Z
   git tag -d vX.Y.Z
   ```
-
-  Then repeat step 4.
 
 - **Only the crates.io job fails.** The GitHub release is already out. Fix the
   cause (an expired token, for example), then re-run just that failed job from
@@ -93,8 +96,10 @@ release pull request only needs the changelog rename.
 
 ## What the workflow checks before building
 
-- The tag has the form `vMAJOR.MINOR.PATCH` and matches the version in
-  `Cargo.toml`.
+- The tag (or the version entered in the Actions tab) has the form
+  `vMAJOR.MINOR.PATCH` and matches the version in `Cargo.toml`.
+- A run from the Actions tab was started on `main`, and its tag doesn't exist
+  yet.
 - `CHANGELOG.md` has a non-empty section for that version.
 - The tagged commit is on `main`.
 - The CI suite passes: formatting, clippy, Rust tests and Python tool tests.
@@ -106,8 +111,10 @@ release pull request only needs the changelog rename.
 - **crates.io token.** The crates.io job reads `CARGO_REGISTRY_TOKEN` from the
   `Crates Publishing` deployment environment (Settings → Environments). If that
   environment limits deployments to certain branches or tags, it must allow
-  `v*` tags, because the job runs on the tag. Scope the token on crates.io to
+  `main` (for runs from the Actions tab) and `v*` tags (for pushed tags). Scope the token on crates.io to
   publishing `parabloom` only, and replace it before it expires.
-- **Tag ruleset.** Add a tag ruleset (Settings → Rules → Rulesets) that
-  restricts who can create or delete `v*` tags. Anyone who can push such a tag
-  can publish a release.
+- **Who can release.** Anyone with write access can start the workflow from
+  the Actions tab, and anyone who can push a `v*` tag can publish a release.
+  A tag ruleset (Settings → Rules → Rulesets) can restrict who creates or
+  deletes `v*` tags. If you add one, let GitHub Actions bypass it so runs from
+  the Actions tab can still create their tag.
