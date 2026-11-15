@@ -7,6 +7,14 @@ release is cut.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-15
+
+No changes to the `parabloom` command itself; this release updates how it is built.
+
+### Changed
+
+- CI and release workflows use `actions/checkout@v5`, which runs on Node.js 24 instead of the deprecated Node.js 20.
+
 ## [0.1.0] - 2026-11-15
 
 ### Added
@@ -17,5 +25,6 @@ release is cut.
 - Column-aware paragraph grouping, matching of every selected quad, and rotation-safe text extraction.
 - Prebuilt binaries for Linux and macOS (x86_64 and arm64), a vendored source archive and SHA-256 checksums on each GitHub release, and publishing to crates.io.
 
-[Unreleased]: https://github.com/jag3773/parabloom/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/jag3773/parabloom/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/jag3773/parabloom/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jag3773/parabloom/releases/tag/v0.1.0
