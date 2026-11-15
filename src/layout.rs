@@ -343,59 +343,208 @@ pub fn find_paragraph_index(paragraphs: &[Paragraph], rect: &Rect) -> Option<usi
     best
 }
 
-/// True for text that is only a page number: up to six digits or lowercase roman
-/// numerals, ignoring surrounding whitespace.
-fn is_page_number(text: &str) -> bool {
+// ---------------------------------------------------------------------------
+// Page furniture: page numbers, footnotes and blank lines
+// ---------------------------------------------------------------------------
+
+const FOOTNOTE_SYMBOLS: [&str; 4] = ["*", "\u{2020}", "\u{2021}", "\u{a7}"];
+
+fn para_text(para: &Paragraph) -> String {
+    para.iter().map(|l| l.text.as_str()).collect()
+}
+
+fn is_blank(para: &Paragraph) -> bool {
+    para_text(para).chars().all(py_isspace)
+}
+
+/// True for a lowercase roman numeral in canonical form (`i` to `mmmcmxcix`),
+/// so words made of the same letters ("civil", "mild") don't qualify.
+fn is_roman(t: &str) -> bool {
+    let value = |c: char| match c {
+        'i' => Some(1),
+        'v' => Some(5),
+        'x' => Some(10),
+        'l' => Some(50),
+        'c' => Some(100),
+        'd' => Some(500),
+        'm' => Some(1000),
+        _ => None,
+    };
+    let Some(digits) = t.chars().map(value).collect::<Option<Vec<u32>>>() else {
+        return false;
+    };
+    if digits.is_empty() {
+        return false;
+    }
+    let mut n = 0u32;
+    for (i, &d) in digits.iter().enumerate() {
+        if digits.get(i + 1).is_some_and(|&next| next > d) {
+            n = n.wrapping_sub(d);
+        } else {
+            n = n.wrapping_add(d);
+        }
+    }
+    if n == 0 || n > 3999 {
+        return false;
+    }
+    let mut canonical = String::new();
+    let mut rest = n;
+    for (v, sym) in [
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ] {
+        while rest >= v {
+            canonical.push_str(sym);
+            rest -= v;
+        }
+    }
+    canonical == t
+}
+
+/// True for text that could be a page number: up to four digits, or a
+/// canonical lowercase roman numeral.
+fn looks_like_page_number(text: &str) -> bool {
     let t = py_rstrip(py_lstrip(text));
-    !t.is_empty()
-        && t.chars().count() <= 6
-        && (t.chars().all(|c| c.is_ascii_digit()) || t.chars().all(|c| "ivxlcdm".contains(c)))
+    (!t.is_empty() && t.len() <= 4 && t.chars().all(|c| c.is_ascii_digit())) || is_roman(t)
+}
+
+/// True for a page number (folio): a lone line of page-number text with no
+/// other text below it or none above it. A year or numeral inside the body
+/// has text on both sides and stays body text.
+fn is_folio(paras: &[Paragraph], i: usize) -> bool {
+    let para = &paras[i];
+    if para.len() != 1 || !looks_like_page_number(&para[0].text) {
+        return false;
+    }
+    let f = &para[0];
+    let others = || {
+        paras
+            .iter()
+            .enumerate()
+            .filter(move |(j, _)| *j != i)
+            .flat_map(|(_, p)| p.iter())
+            .filter(|l| !l.text.chars().all(py_isspace))
+            .map(|l| (l.y0 + l.y1) / 2.0)
+    };
+    let nothing_below = others().all(|c| c <= f.y1);
+    let nothing_above = others().all(|c| c >= f.y0);
+    nothing_below || nothing_above
+}
+
+fn is_marker_text(text: &str) -> bool {
+    let t = py_rstrip(py_lstrip(text));
+    (!t.is_empty() && t.len() <= 3 && t.chars().all(|c| c.is_ascii_digit()))
+        || FOOTNOTE_SYMBOLS.contains(&t)
+}
+
+/// Body line height for the page: the 75th-percentile height of its
+/// non-blank lines, so a page dense with footnotes still reflects its body
+/// type rather than the notes'.
+fn typical_height(paras: &[Paragraph]) -> Option<f64> {
+    let mut heights: Vec<f64> = paras
+        .iter()
+        .flatten()
+        .filter(|l| !l.text.chars().all(py_isspace))
+        .map(|l| l.y1 - l.y0)
+        .collect();
+    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    heights.get(heights.len() * 3 / 4).copied()
+}
+
+/// True when `marker` is a footnote marker for `text`: level with the text
+/// line and to its left (hanging-number layouts leave up to a few ems). The
+/// marker is either a superscript, set noticeably shorter than the text, or
+/// a full-size number beside text that is itself set smaller than the
+/// page's typical line. MuPDF reports the marker as a line of its own, and
+/// column splitting can move it into a paragraph of its own.
+fn marks(marker: &Line, text: &Line, typical: Option<f64>) -> bool {
+    let (mh, th) = (marker.y1 - marker.y0, text.y1 - text.y0);
+    let superscript = mh < 0.8 * th;
+    let small_note = typical.is_some_and(|t| mh < 0.85 * t && th < 0.85 * t);
+    is_marker_text(&marker.text)
+        && (superscript || small_note)
+        && marker.y0 < text.y1
+        && text.y0 < marker.y1
+        && text.x0 >= marker.x1 - 1.0
+        && text.x0 - marker.x1 <= 48.0
+}
+
+/// True for a paragraph that looks like a footnote: a superscript marker
+/// starts it, whether the marker stayed in the paragraph (one of its first
+/// two lines, at its left edge) or grouping split it into a neighbouring
+/// paragraph. A paragraph holding only the split-off marker counts too.
+fn is_footnote(paras: &[Paragraph], i: usize) -> bool {
+    let para = &paras[i];
+    if para.len() >= 2 {
+        let left = py_min(para.iter().map(|l| l.x0)).unwrap_or(0.0);
+        let tallest = para.iter().map(|l| l.y1 - l.y0).fold(0.0, f64::max);
+        if para.iter().take(2).any(|l| {
+            is_marker_text(&l.text) && (l.x0 - left).abs() <= 1.0 && (l.y1 - l.y0) < 0.8 * tallest
+        }) {
+            return true;
+        }
+    }
+    let first = &para[0];
+    let typical = typical_height(paras);
+    if paras.iter().enumerate().any(|(j, other)| {
+        j != i && (marks(&other[0], first, typical) || marks(first, &other[0], typical))
+    }) {
+        return true;
+    }
+    // A paragraph holding only a marker set shorter than the page's typical
+    // line is a split-off footnote marker even when its text sits too far
+    // away to pair with.
+    if para.len() == 1 && is_marker_text(&first.text) {
+        return typical.is_some_and(|t| (first.y1 - first.y0) < 0.8 * t);
+    }
+    false
+}
+
+/// True for body text: not blank, not a page number, not a footnote.
+fn is_body(paras: &[Paragraph], i: usize) -> bool {
+    !is_blank(&paras[i]) && !is_folio(paras, i) && !is_footnote(paras, i)
 }
 
 /// Drop page furniture a long selection catches by accident: blank
 /// paragraphs, and page numbers when the highlight also reaches real text.
 /// Leaves `matches` alone if nothing else would remain.
 pub fn drop_page_furniture(paragraphs: &[Paragraph], matches: &mut Vec<usize>) {
-    let text = |i: usize| -> String { paragraphs[i].iter().map(|l| l.text.as_str()).collect() };
     let mut kept: Vec<usize> = matches
         .iter()
         .copied()
-        .filter(|&i| !text(i).chars().all(py_isspace))
+        .filter(|&i| !is_blank(&paragraphs[i]))
         .collect();
-    if kept.iter().any(|&i| !is_page_number(&text(i))) {
-        kept.retain(|&i| !is_page_number(&text(i)));
+    if kept.iter().any(|&i| !is_folio(paragraphs, i)) {
+        kept.retain(|&i| !is_folio(paragraphs, i));
     }
     if !kept.is_empty() {
         *matches = kept;
     }
 }
 
-/// True for a paragraph that looks like a footnote: one of its first two
-/// lines is a footnote marker (up to three digits, or `*` `†` `‡` `§`) set at
-/// the paragraph's left edge and noticeably shorter than its tallest line.
-/// MuPDF puts such a superscript marker on a line of its own.
-fn is_footnote(para: &Paragraph) -> bool {
-    if para.len() < 2 {
-        return false;
-    }
-    let left = py_min(para.iter().map(|l| l.x0)).unwrap_or(0.0);
-    let tallest = para.iter().map(|l| l.y1 - l.y0).fold(0.0, f64::max);
-    para.iter().take(2).any(|l| {
-        let t = py_rstrip(py_lstrip(&l.text));
-        let marker = (!t.is_empty() && t.len() <= 3 && t.chars().all(|c| c.is_ascii_digit()))
-            || ["*", "\u{2020}", "\u{2021}", "\u{a7}"].contains(&t);
-        marker && (l.x0 - left).abs() <= 1.0 && (l.y1 - l.y0) < 0.8 * tallest
-    })
-}
-
 /// Index of the page's last body paragraph: the one a page-bottom sentence
 /// would continue from. Footnotes above the `footnote_y` cut-off, a page
 /// number and blank lines would otherwise take that place.
 pub fn last_body_index(paras: &[Paragraph]) -> Option<usize> {
-    (0..paras.len()).rev().find(|&i| {
-        let text: String = paras[i].iter().map(|l| l.text.as_str()).collect();
-        !is_footnote(&paras[i]) && !is_page_number(&text) && !text.chars().all(py_isspace)
-    })
+    (0..paras.len()).rev().find(|&i| is_body(paras, i))
+}
+
+/// Lines of the page's body paragraphs, skipping `skip` (an index or none).
+fn body_lines(paras: &[Paragraph], skip: Option<usize>) -> impl Iterator<Item = &Line> {
+    (0..paras.len())
+        .filter(move |&i| Some(i) != skip && is_body(paras, i))
+        .flat_map(move |i| paras[i].iter())
 }
 
 /// For each page, whether its first paragraph continues the last paragraph
@@ -438,10 +587,21 @@ pub fn detect_page_continuations(page_paragraphs: &[Vec<Paragraph>]) -> Vec<bool
             let curr_right = py_max(curr_paras.iter().flatten().map(|l| l.x1)).unwrap();
             let is_short_line = curr_first.len() == 1
                 && (first_line.x1 - first_line.x0) < 0.6 * (curr_right - left_margin);
-            let mut heights: Vec<f64> = curr_paras.iter().flatten().map(|l| l.y1 - l.y0).collect();
-            heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let body_height = heights[heights.len() / 2];
-            let is_large = curr_first.iter().all(|l| l.y1 - l.y0 > 1.15 * body_height);
+            // Body line height comes from the rest of the page, so a tall
+            // title can't set its own baseline; a page with nothing else on
+            // it borrows the previous page's body text.
+            let heights_of = |lines: &mut dyn Iterator<Item = &Line>| -> Vec<f64> {
+                let mut h: Vec<f64> = lines.map(|l| l.y1 - l.y0).collect();
+                h.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                h
+            };
+            let mut heights = heights_of(&mut body_lines(curr_paras, Some(0)));
+            if heights.is_empty() {
+                heights = heights_of(&mut body_lines(prev_paras, None));
+            }
+            let is_large = heights.get(heights.len() / 2).is_some_and(|&body_height| {
+                curr_first.iter().all(|l| l.y1 - l.y0 > 1.15 * body_height)
+            });
             if is_short_line || is_large {
                 continue;
             }
@@ -466,11 +626,13 @@ pub fn detect_page_continuations(page_paragraphs: &[Vec<Paragraph>]) -> Vec<bool
             }
         }
 
-        let right_margin = py_max(prev_paras.iter().flatten().map(|l| l.x1)).unwrap();
+        // Margin evidence comes from body text only: a page number or a
+        // footnote says nothing about where body lines end.
+        let right_margin = py_max(body_lines(prev_paras, None).map(|l| l.x1)).unwrap();
         let last = &prev_last[prev_last.len() - 1];
         // A page containing only one line provides no independent evidence
         // of its body margin; rely on the text signals in that case.
-        let has_margin_evidence = prev_paras.iter().map(Vec::len).sum::<usize>() > 1;
+        let has_margin_evidence = body_lines(prev_paras, None).count() > 1;
         let prev_reaches_margin = has_margin_evidence && last.x1 >= right_margin - MARGIN_TOLERANCE;
         let prev_lacks_terminal_punct = !line_ends_with_sentence_punct(&last.text);
         let curr_starts_lowercase = line_starts_with_lowercase(&curr_first[0].text);
@@ -766,22 +928,254 @@ mod tests {
     #[test]
     fn page_furniture_dropped_from_long_selections() {
         let page = vec![
+            vec![line(280.0, 40.0, 300.0, 52.0, "xii")],
             vec![line(72.0, 100.0, 540.0, 112.0, "body text")],
             vec![line(72.0, 120.0, 540.0, 132.0, " ")],
             vec![line(300.0, 700.0, 312.0, 712.0, "26")],
-            vec![line(300.0, 720.0, 312.0, 732.0, "xii")],
         ];
+        // Top and bottom folios and a blank line all go.
         let mut m = vec![0, 1, 2, 3];
         drop_page_furniture(&page, &mut m);
-        assert_eq!(m, vec![0]);
+        assert_eq!(m, vec![1]);
         // A highlight on the page number alone keeps it.
+        let mut m = vec![3];
+        drop_page_furniture(&page, &mut m);
+        assert_eq!(m, vec![3]);
+        // Only blank lines: leave the match alone rather than lose it.
         let mut m = vec![2];
         drop_page_furniture(&page, &mut m);
         assert_eq!(m, vec![2]);
-        // Only blank lines: leave the match alone rather than lose it.
-        let mut m = vec![1];
-        drop_page_furniture(&page, &mut m);
-        assert_eq!(m, vec![1]);
+    }
+
+    #[test]
+    fn numeric_body_text_is_not_a_folio() {
+        // A year and a roman-letter word on lines of their own inside the
+        // body, selected along with the paragraph above: both are kept.
+        for word in ["2026", "civil", "mild"] {
+            let page = vec![
+                vec![line(72.0, 100.0, 540.0, 112.0, "The plan was adopted in")],
+                vec![line(72.0, 134.0, 110.0, 146.0, word)],
+                vec![line(
+                    72.0,
+                    170.0,
+                    540.0,
+                    182.0,
+                    "More body text follows here.",
+                )],
+                vec![line(300.0, 700.0, 312.0, 712.0, "9")],
+            ];
+            let mut m = vec![0, 1];
+            drop_page_furniture(&page, &mut m);
+            assert_eq!(m, vec![0, 1], "{word}");
+            assert_eq!(last_body_index(&page), Some(2), "{word}");
+        }
+        assert!(is_roman("xii") && is_roman("iv") && is_roman("mcmxc"));
+        assert!(!is_roman("civil") && !is_roman("mild") && !is_roman("iiii") && !is_roman(""));
+    }
+
+    #[test]
+    fn folio_is_not_margin_evidence() {
+        // One finished full-width body line, then a fresh capitalised
+        // paragraph: no bridge, with or without a centred folio below.
+        let body = vec![line(72.0, 600.0, 540.0, 612.0, "This section is complete.")];
+        let next = vec![vec![
+            line(
+                72.0,
+                72.0,
+                540.0,
+                84.0,
+                "A new paragraph opens the next page",
+            ),
+            line(72.0, 86.0, 540.0, 98.0, "and carries on."),
+        ]];
+        let alone = vec![body.clone()];
+        assert_eq!(
+            detect_page_continuations(&[alone, next.clone()]),
+            vec![false, false]
+        );
+        let with_folio = vec![body, vec![line(300.0, 745.0, 306.0, 757.0, "9")]];
+        assert_eq!(
+            detect_page_continuations(&[with_folio, next]),
+            vec![false, false]
+        );
+    }
+
+    #[test]
+    fn split_footnote_marker_through_the_pipeline() {
+        // MuPDF returns the footnote as one block, but its superscript
+        // marker (x 72-77) and its text (x 84-400) don't overlap, so column
+        // splitting turns them into separate paragraphs.
+        let block = |lines: Vec<Line>| {
+            let x0 = lines.iter().map(|l| l.x0).fold(f64::INFINITY, f64::min);
+            let y0 = lines.iter().map(|l| l.y0).fold(f64::INFINITY, f64::min);
+            let x1 = lines.iter().map(|l| l.x1).fold(f64::NEG_INFINITY, f64::max);
+            let y1 = lines.iter().map(|l| l.y1).fold(f64::NEG_INFINITY, f64::max);
+            Block {
+                bbox: [x0, y0, x1, y1],
+                lines,
+            }
+        };
+        let page0 = vec![
+            block(vec![
+                line(
+                    72.0,
+                    600.0,
+                    540.0,
+                    612.0,
+                    "a body sentence that runs to the",
+                ),
+                line(72.0, 614.0, 540.0, 626.0, "margin and keeps going into the"),
+            ]),
+            block(vec![
+                line(
+                    84.0,
+                    688.0,
+                    400.0,
+                    700.0,
+                    "See the appendix for the full survey.",
+                ),
+                line(72.0, 689.0, 77.0, 695.0, "1"),
+            ]),
+        ];
+        let page1 = vec![block(vec![
+            line(72.0, 72.0, 540.0, 84.0, "next page, where it finally ends."),
+            line(72.0, 86.0, 300.0, 98.0, "Done."),
+        ])];
+        let params = Params::default();
+        let pages = vec![
+            group_lines_into_paragraphs(&page0, &params),
+            group_lines_into_paragraphs(&page1, &params),
+        ];
+        assert_eq!(pages[0].len(), 3, "body, footnote text, marker");
+        // A hanging marker further left still pairs with its text.
+        let hanging = vec![
+            vec![line(
+                72.0,
+                600.0,
+                540.0,
+                612.0,
+                "body text that runs on to the",
+            )],
+            vec![line(
+                125.0,
+                688.0,
+                540.0,
+                700.0,
+                "Guthrie observes that these",
+            )],
+            vec![line(90.0, 689.0, 97.0, 695.0, "17")],
+        ];
+        assert_eq!(last_body_index(&hanging), Some(0));
+        // Full-size footnote numbers: no superscript to pair, but the notes
+        // are set smaller than the body, so they still don't end the page.
+        let small_notes = vec![
+            vec![
+                line(
+                    60.0,
+                    500.0,
+                    540.0,
+                    512.0,
+                    "Over time the original patterns were",
+                ),
+                line(
+                    60.0,
+                    516.0,
+                    540.0,
+                    528.0,
+                    "forgotten, and the tendency toward",
+                ),
+                line(
+                    60.0,
+                    532.0,
+                    540.0,
+                    544.0,
+                    "eisegesis grew until study Bibles",
+                ),
+            ],
+            vec![line(60.0, 622.0, 71.0, 631.0, " 16 ")],
+            vec![
+                line(
+                    90.0,
+                    621.0,
+                    541.0,
+                    630.0,
+                    "Strauch, Biblical Eldership, 37.",
+                ),
+                line(90.0, 631.0, 543.0, 640.0, "Philip Schaff noted in 1910."),
+            ],
+            vec![line(60.0, 656.0, 71.0, 665.0, " 17 ")],
+            vec![line(
+                90.0,
+                656.0,
+                537.0,
+                665.0,
+                "Guthrie observes: these three",
+            )],
+            vec![line(304.0, 745.0, 308.0, 755.0, "7")],
+        ];
+        assert_eq!(last_body_index(&small_notes), Some(0));
+        let body = pages[0]
+            .iter()
+            .position(|p| p[0].text.starts_with("a body"))
+            .unwrap();
+        let note = pages[0]
+            .iter()
+            .position(|p| p[0].text.starts_with("See the"))
+            .unwrap();
+        assert_eq!(last_body_index(&pages[0]), Some(body));
+        let cont = detect_page_continuations(&pages);
+        assert_eq!(cont, vec![false, true]);
+        let segs = walk_segments(&pages, &cont, 1, 0);
+        assert!(segs.contains(&(0, body)), "{segs:?}");
+        assert!(!segs.contains(&(0, note)), "{segs:?}");
+    }
+
+    #[test]
+    fn sparse_page_wrapped_title_is_a_heading() {
+        // A two-line title set at 28pt over a single 12pt body line: the
+        // title must not set the body height it is compared against.
+        let prev = vec![vec![
+            line(
+                72.0,
+                600.0,
+                540.0,
+                612.0,
+                "a sentence that does not finish on",
+            ),
+            line(
+                72.0,
+                614.0,
+                540.0,
+                626.0,
+                "this page because it keeps on going",
+            ),
+        ]];
+        let curr = vec![
+            vec![
+                line(72.0, 72.0, 400.0, 100.0, "Communicating Powerfully to"),
+                line(72.0, 102.0, 200.0, 130.0, "People"),
+            ],
+            vec![line(
+                72.0,
+                150.0,
+                540.0,
+                162.0,
+                "Body text follows the title here.",
+            )],
+        ];
+        assert_eq!(
+            detect_page_continuations(&[prev.clone(), curr]),
+            vec![false, false]
+        );
+        // With nothing else on the page, the previous page's body sets it.
+        let only_title = vec![vec![
+            line(72.0, 72.0, 400.0, 100.0, "Communicating Powerfully to"),
+            line(72.0, 102.0, 200.0, 130.0, "People"),
+        ]];
+        assert_eq!(
+            detect_page_continuations(&[prev, only_title]),
+            vec![false, false]
+        );
     }
 
     #[test]
