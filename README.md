@@ -28,8 +28,8 @@ PDFs store positioned characters, not paragraphs. Parabloom rebuilds paragraphs 
 
 1. **Extract.** MuPDF segments each page into text blocks and lines. Parabloom rebuilds each line box from its character boxes, as PyMuPDF does, so the numbers match.
 2. **Group.** Blocks containing disjoint columns are split before paragraph grouping. Single-line blocks merge by indent and vertical gap. A block that looks like a split of the open paragraph (normal line gap, flush left or centred with it, sentence still running) merges into it.
-3. **Bridge pages.** A paragraph continues onto the next page when that page starts flush left and the previous page ended mid-sentence, at the page's body-text right margin, or the next line starts lowercase. A lone centred or all-caps last line counts as an attribution and blocks the bridge.
-4. **Replace.** Every selected quad is matched against text-line boxes in both axes. All intersected paragraphs are expanded, with one highlight per paragraph segment. Existing annotations are reused where possible, and merged annotations retain their notes and reply relationships.
+3. **Bridge pages.** A paragraph continues onto the next page when that page starts flush left and the previous page's last body paragraph ended mid-sentence, at the page's body-text right margin, or the next line starts lowercase. Footnotes, page numbers and blank lines at the bottom of a page don't count as its last paragraph. A lone centred or all-caps last line counts as an attribution, and a heading at the top of the next page (a short lone line such as "Appendix 3:", or a title set larger than the body text) blocks the bridge too.
+4. **Replace.** Every selected quad is matched against text-line boxes in both axes. All intersected paragraphs are expanded, with one highlight per paragraph segment. Existing annotations are reused where possible, and merged annotations retain their notes and reply relationships. Blank paragraphs, and a page number swept up by a long selection, are left out.
 
 ## Parity with the Python script
 
@@ -56,6 +56,7 @@ On each of the 91 differing pages, MuPDF 1.27 extracted different blocks than 1.
 - **MuPDF version.** The `mupdf` crate bundles MuPDF 1.27.2; PyMuPDF 1.26.5 ships 1.26.10. On a small share of pages 1.27 groups lines into blocks differently, which can change how far a highlight reaches.
 - **Appearance stream bytes.** Both draw the same paths in the same colour and graphics state. PyMuPDF wraps its stream in an extra `q … Q` and repeats `/H gs`.
 - **`/NM` names.** Existing annotation names are retained. New annotations use names such as `parabloom-A0`.
+- **Page bridges.** The Python script treats whatever sits last on a page as the paragraph that may continue: often a page number or a footnote. Highlights then bridge onto page numbers, footnotes and the next page's headings, while real continuations in books with page numbers at the bottom never bridge. Parabloom skips footnotes, page numbers and blank lines when finding a page's last paragraph, and refuses to bridge onto a heading.
 - **Rotated pages** follow PyMuPDF's approach (work with `/Rotate` set to 0, then restore it) and the extraction example uses the same path. Generated regression fixtures cover rotation; the historical corpus did not contain highlighted rotated pages.
 
 ## Building
