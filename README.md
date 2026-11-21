@@ -16,7 +16,7 @@ Pass the same path twice to overwrite in place. Parabloom then saves incremental
 |---|---|---|
 | `--indent-x N` | 80 | A single-line block whose left edge passes this X starts a new paragraph. Lower it for small-page books (45 suits 432×648 pt ebooks). |
 | `--gap-threshold N` | 12 | A vertical gap larger than this (points) between lines starts a new paragraph. |
-| `--footnote-y N` | 720 | Lines starting below this Y count as footnotes and are ignored. |
+| `--footnote-y N` | 720 | Lines starting below this Y count as footnotes and are ignored, unless they carry on the body text above them (same column, left edge, line height and line spacing). |
 | `--no-blue-on-image` | off | Keep original colours on pages with images. By default those highlights turn blue (0.2, 0.4, 0.8). |
 | `--debug` | off | Print page continuations and each expanded paragraph. |
 
