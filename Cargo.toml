@@ -1,6 +1,6 @@
 [package]
 name = "parabloom"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Expand partial PDF highlights to cover the full paragraph"
 license = "MIT"

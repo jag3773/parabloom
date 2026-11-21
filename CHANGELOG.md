@@ -7,6 +7,10 @@ release is cut.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-21
+
+This release changes how lines group into paragraphs and which text a highlight reaches near the bottom of a page, so some highlights come out differently than in 0.2.0.
+
 ### Fixed
 
 - A one-line text block that sits flush with the page's left margin, or with its body-text margin, no longer counts as an indented paragraph start just because that margin lies past `--indent-x`. PDFs that put every line in its own block with a margin past 80 pt (such as browser print-to-PDF pages) used to get one highlight per line instead of one per paragraph. A larger gap than the paragraph's own line spacing, or a line set in much larger or smaller type, still starts a new paragraph, so a heading at the body margin stays separate.
@@ -36,6 +40,7 @@ This release changes which text a highlight grows into across page breaks, so so
 - Column-aware paragraph grouping, matching of every selected quad, and rotation-safe text extraction.
 - Prebuilt binaries for Linux and macOS (x86_64 and arm64), a vendored source archive and SHA-256 checksums on each GitHub release, and publishing to crates.io.
 
-[Unreleased]: https://github.com/jag3773/parabloom/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jag3773/parabloom/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jag3773/parabloom/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jag3773/parabloom/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jag3773/parabloom/releases/tag/v0.1.0
