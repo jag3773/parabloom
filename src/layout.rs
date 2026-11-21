@@ -122,8 +122,8 @@ pub fn line_starts_with_lowercase(text: &str) -> bool {
 /// dropped as footnotes, unless they carry on the body text above them: a
 /// line is kept when the nearest kept line above it in the same column has
 /// the same left edge and line height, and the gap between them matches
-/// that line's own gap to the line above it, and it is set at the page's
-/// body size. Notes set in smaller type, or after a larger gap, are still
+/// that line's own gap to the line above it, and it is set at the body
+/// size of the rest of the page. Notes set in smaller type, or after a larger gap, are still
 /// dropped.
 fn footnote_zone_keep(blocks: &[Block], footnote_y: f64) -> Vec<Vec<bool>> {
     let mut keep: Vec<Vec<bool>> = blocks
@@ -153,38 +153,38 @@ fn footnote_zone_keep(blocks: &[Block], footnote_y: f64) -> Vec<Vec<bool>> {
     if candidates.is_empty() {
         return keep;
     }
-    // Only body-sized lines are rescued; notes in smaller type stay cut.
-    // Body size is the line height that carries half the page's text, so
-    // a few tall title lines or a block of notes don't set it.
-    let mut sized: Vec<(f64, usize)> = pool
-        .iter()
-        .map(|l| {
-            (
-                l.y1 - l.y0,
-                l.text.chars().filter(|c| !py_isspace(*c)).count(),
-            )
+    // Body size: the line height that carries half of the given lines'
+    // text, so a few tall title lines don't set it.
+    fn body_height<'a>(lines: impl Iterator<Item = &'a Line>) -> Option<f64> {
+        let mut sized: Vec<(f64, usize)> = lines
+            .map(|l| {
+                (
+                    l.y1 - l.y0,
+                    l.text.chars().filter(|c| !py_isspace(*c)).count(),
+                )
+            })
+            .collect();
+        sized.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let total: usize = sized.iter().map(|(_, n)| n).sum();
+        let mut seen = 0;
+        sized.iter().find_map(|&(h, n)| {
+            seen += n;
+            (2 * seen >= total).then_some(h)
         })
-        .collect();
-    sized.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    let total: usize = sized.iter().map(|(_, n)| n).sum();
-    let mut seen = 0;
-    let Some(body_h) = sized.iter().find_map(|&(h, n)| {
-        seen += n;
-        (2 * seen >= total).then_some(h)
-    }) else {
-        return keep;
-    };
+    }
     candidates.sort_by(|a, b| {
         let (la, lb) = (&blocks[a.0].lines[a.1], &blocks[b.0].lines[b.1]);
         la.y0
             .partial_cmp(&lb.y0)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    // Nearest pool line above `l` in the same column.
+    // Nearest pool line above `l` in the same column. It must start above
+    // `l`, so a line under a point tall is never its own neighbour and a
+    // walk up the page always ends.
     fn above<'a>(pool: &[&'a Line], l: &Line) -> Option<&'a Line> {
         pool.iter()
             .copied()
-            .filter(|p| p.y1 <= l.y0 + 1.0 && l.x0 < p.x1 + 3.0 && p.x0 < l.x1 + 3.0)
+            .filter(|p| p.y0 < l.y0 && p.y1 <= l.y0 + 1.0 && l.x0 < p.x1 + 3.0 && p.x0 < l.x1 + 3.0)
             .max_by(|a, b| a.y1.partial_cmp(&b.y1).unwrap_or(std::cmp::Ordering::Equal))
     }
     for (bi, li) in candidates {
@@ -197,6 +197,28 @@ fn footnote_zone_keep(blocks: &[Block], footnote_y: f64) -> Vec<Vec<bool>> {
         };
         let (h, ph, ph2) = (c.y1 - c.y0, prev.y1 - prev.y0, prev2.y1 - prev2.y0);
         let (gap, pgap) = (c.y0 - prev.y1, prev.y0 - prev2.y1);
+        // The run of lines this one would continue: same column, edge,
+        // height and rhythm, walking up from the line above.
+        let mut run: Vec<&Line> = vec![prev];
+        let mut top = prev;
+        while let Some(up) = above(&pool, top) {
+            let fits = ((up.y1 - up.y0) - ph).abs() <= 0.08 * ph
+                && ((top.y0 - up.y1) - pgap).abs() <= 1.5
+                && (up.x0 - top.x0).abs() <= 3.0;
+            if !fits {
+                break;
+            }
+            run.push(up);
+            top = up;
+        }
+        // Only body-sized lines are rescued; notes in smaller type stay cut.
+        // Body size comes from the rest of the page, so a block of notes
+        // can't vouch for its own size; a page that is all one run is body.
+        let rest = pool
+            .iter()
+            .copied()
+            .filter(|l| !run.iter().any(|r| std::ptr::eq(*r, *l)));
+        let body_h = body_height(rest).unwrap_or(h);
         let same_height =
             (h - ph).abs() <= 0.08 * ph && (ph - ph2).abs() <= 0.08 * ph && h >= 0.9 * body_h;
         let same_rhythm = gap >= -1.0 && (gap - pgap).abs() <= 1.5;
@@ -385,10 +407,15 @@ pub fn group_lines_into_paragraphs(blocks: &[Block], params: &Params) -> Vec<Par
                 // paragraph's own line spacing: a gap clearly larger than
                 // its lines show is a paragraph break even below
                 // gap_threshold.
-                let line_spaced = match current.as_slice() {
-                    [.., a, b] => line_gap <= (b.y0 - a.y1) + 2.5,
-                    _ => true,
-                };
+                // They also need type of a compatible size: a heading set
+                // much larger than the line after it is not that line's
+                // paragraph, even when the heading stands alone.
+                let compatible = bump <= 0.25 * h_prev.min(h_first);
+                let line_spaced = compatible
+                    && match current.as_slice() {
+                        [.., a, b] => line_gap <= (b.y0 - a.y1) + 2.5,
+                        _ => true,
+                    };
                 let indented = first.x0 > indent_x && !((flush || wraps) && line_spaced);
                 indented
                     || line_gap > gap_threshold
@@ -682,31 +709,63 @@ fn furniture_key(text: &str) -> String {
 }
 
 /// Which paragraphs of page `p` are page furniture: a running head or
-/// footer whose every non-blank line repeats, at the same height, on a page
-/// up to two pages either side. Blank paragraphs are not furniture here.
+/// footer at the top or bottom edge of the page (no other text above it, or
+/// none below it) whose every non-blank line repeats, at the same height,
+/// on at least two other pages up to two pages either side. A row that
+/// merely recurs on one neighbouring page, or mid-page, is body text; blank
+/// paragraphs are not furniture here.
 fn page_furniture(page_paragraphs: &[Vec<Paragraph>], p: usize) -> Vec<bool> {
     let lo = p.saturating_sub(2);
     let hi = (p + 2).min(page_paragraphs.len() - 1);
-    let others: Vec<(f64, String)> = (lo..=hi)
+    let neighbours: Vec<Vec<(f64, String)>> = (lo..=hi)
         .filter(|&q| q != p)
-        .flat_map(|q| page_paragraphs[q].iter().flatten())
-        .map(|l| (l.y0, furniture_key(&l.text)))
-        .filter(|(_, k)| !k.is_empty())
+        .map(|q| {
+            page_paragraphs[q]
+                .iter()
+                .flatten()
+                .map(|l| (l.y0, furniture_key(&l.text)))
+                .filter(|(_, k)| !k.is_empty())
+                .collect()
+        })
         .collect();
-    page_paragraphs[p]
+    let paras = &page_paragraphs[p];
+    let at_edge = |i: usize| {
+        let (Some(y0), Some(y1)) = (
+            py_min(paras[i].iter().map(|l| l.y0)),
+            py_max(paras[i].iter().map(|l| l.y1)),
+        ) else {
+            return false;
+        };
+        let others = || {
+            paras
+                .iter()
+                .enumerate()
+                .filter(move |(j, _)| *j != i)
+                .flat_map(|(_, para)| para.iter())
+                .filter(|l| !l.text.chars().all(py_isspace))
+                .map(|l| (l.y0 + l.y1) / 2.0)
+        };
+        others().all(|c| c >= y0) || others().all(|c| c <= y1)
+    };
+    paras
         .iter()
-        .map(|para| {
+        .enumerate()
+        .map(|(i, para)| {
             let keys: Vec<(f64, String)> = para
                 .iter()
                 .map(|l| (l.y0, furniture_key(&l.text)))
                 .filter(|(_, k)| !k.is_empty())
                 .collect();
-            !keys.is_empty()
-                && keys.iter().all(|(y0, key)| {
-                    others
-                        .iter()
-                        .any(|(oy, k)| (y0 - oy).abs() <= 2.0 && k == key)
+            let repeats_on = neighbours
+                .iter()
+                .filter(|page| {
+                    keys.iter().all(|(y0, key)| {
+                        page.iter()
+                            .any(|(oy, k)| (y0 - oy).abs() <= 2.0 && k == key)
+                    })
                 })
+                .count();
+            !keys.is_empty() && at_edge(i) && repeats_on >= 2
         })
         .collect()
 }
@@ -1125,6 +1184,61 @@ mod tests {
     }
 
     #[test]
+    fn large_heading_before_body_stays_separate() {
+        // A 24 pt heading, then 12 pt body lines, all flush at x=84 (past
+        // indent_x) in one-line blocks.
+        let one = |y0: f64, y1: f64, text: &str| Block {
+            bbox: [84.0, y0, 500.0, y1],
+            lines: vec![line(84.0, y0, 500.0, y1, text)],
+        };
+        let blocks = vec![
+            one(100.0, 124.0, "A Large Heading"),
+            one(134.0, 146.0, "Body text starts here and"),
+            one(148.0, 160.0, "carries on to the end."),
+        ];
+        let paras = group_lines_into_paragraphs(&blocks, &Params::default());
+        assert_eq!(paras.iter().map(Vec::len).collect::<Vec<_>>(), [1, 2]);
+    }
+
+    #[test]
+    fn repeated_body_rows_are_not_furniture() {
+        // Report rows at the same height on adjacent pages, differing only
+        // in their numbers. The row closing page 0 is its last body
+        // paragraph, so page 1's continuation bridges back to it.
+        let body = |y0: f64, text: &str| line(84.0, y0, 520.0, y0 + 15.0, text);
+        let pages = vec![
+            vec![
+                vec![body(100.0, "An earlier paragraph ends here.")],
+                vec![body(350.0, "Case 1 has balance 100 and")],
+            ],
+            vec![
+                vec![body(40.0, "carries on from the previous page.")],
+                vec![body(350.0, "Case 2 has balance 200 and")],
+            ],
+        ];
+        assert_eq!(page_furniture(&pages, 0), vec![false, false]);
+        assert_eq!(last_body_on(&pages, 0), Some(1));
+        let cont = detect_page_continuations(&pages);
+        assert_eq!(walk_segments(&pages, &cont, 1, 0), vec![(1, 0), (0, 1)]);
+
+        // A line repeated at the page edge on two other nearby pages is a
+        // running head; mid-page, the same repetition is body text.
+        let words = ["Alpha", "Bravo", "Charlie"];
+        let page = |n: usize, head_y: f64| {
+            let w = words[n - 1];
+            vec![
+                vec![body(head_y, &format!("Report {n} of 9"))],
+                vec![body(100.0, &format!("{w} opens the body text."))],
+                vec![body(500.0, &format!("{w} closes the body text."))],
+            ]
+        };
+        let headed: Vec<Vec<Paragraph>> = (1..=3).map(|n| page(n, 10.0)).collect();
+        assert_eq!(page_furniture(&headed, 1), vec![true, false, false]);
+        let mid: Vec<Vec<Paragraph>> = (1..=3).map(|n| page(n, 300.0)).collect();
+        assert_eq!(page_furniture(&mid, 1), vec![false, false, false]);
+    }
+
+    #[test]
     fn superscript_line_does_not_split_its_paragraph() {
         // 18 pt lines, 10.8 pt apart; a footnote reference makes one line's
         // box 21.8 pt tall, so its measured gap (12.6) passes gap_threshold.
@@ -1177,7 +1291,7 @@ mod tests {
         let body = |y0: f64, text: &str| line(84.0, y0, 520.0, y0 + 15.0, text);
         // A browser prints the same title at the top of every page and a
         // page count at the bottom.
-        let header = vec![line(
+        let header: Paragraph = vec![line(
             0.0,
             0.1,
             612.0,
@@ -1198,7 +1312,7 @@ mod tests {
             vec![line(0.0, 780.6, 28.3, 791.7, "6 of 16")],
         ];
         let curr = vec![
-            header,
+            header.clone(),
             vec![
                 body(40.0, "supporting them as they go out to plant churches,"),
                 body(64.0, "and that is the plan for the next few years."),
@@ -1206,11 +1320,16 @@ mod tests {
             vec![body(100.0, "Another paragraph.")],
             vec![line(0.0, 780.6, 28.3, 791.7, "7 of 16")],
         ];
+        let next = vec![
+            header.clone(),
+            vec![body(40.0, "The next page opens a new paragraph.")],
+            vec![line(0.0, 780.6, 28.3, 791.7, "8 of 16")],
+        ];
         // The running head opening the page blocks the bridge, as a heading
         // would, so it is never highlighted as the paragraph's other half.
-        let pages = vec![prev.clone(), curr.clone()];
+        let pages = vec![prev.clone(), curr.clone(), next.clone()];
         let cont = detect_page_continuations(&pages);
-        assert_eq!(cont, vec![false, false]);
+        assert!(!cont[1]);
         assert_eq!(walk_segments(&pages, &cont, 0, 2), vec![(0, 2)]);
         assert_eq!(walk_segments(&pages, &cont, 1, 0), vec![(1, 0)]);
 
@@ -1218,9 +1337,9 @@ mod tests {
         // page count below it is not taken as the previous page's last
         // paragraph.
         let headless: Vec<Paragraph> = curr[1..].to_vec();
-        let pages = vec![prev.clone(), headless];
+        let pages = vec![prev.clone(), headless, next.clone()];
         let cont = detect_page_continuations(&pages);
-        assert_eq!(cont, vec![false, true]);
+        assert!(cont[1]);
         assert_eq!(walk_segments(&pages, &cont, 0, 2), vec![(0, 2), (1, 0)]);
         assert_eq!(walk_segments(&pages, &cont, 1, 0), vec![(1, 0), (0, 2)]);
 
@@ -1228,10 +1347,7 @@ mod tests {
         // bridge, even when it is set smaller than the body text.
         let mut headed = curr;
         headed[0] = vec![line(84.0, 0.1, 240.0, 11.2, "The Library of Congress")];
-        assert_eq!(
-            detect_page_continuations(&[prev, headed]),
-            vec![false, false]
-        );
+        assert!(!detect_page_continuations(&[prev, headed, next])[1]);
     }
 
     #[test]
@@ -1328,6 +1444,63 @@ mod tests {
             assert_eq!(paras.iter().map(Vec::len).sum::<usize>(), 3);
             blocks.pop();
         }
+    }
+
+    #[test]
+    fn notes_on_a_note_dense_page_stay_cut() {
+        // Three short 16.5 pt body lines, four long 8.8 pt note lines above
+        // the cut: the notes carry most of the text, but a fifth note line
+        // below the cut is still not body text.
+        let one = |x0: f64, y0: f64, h: f64, text: &str| Block {
+            bbox: [x0, y0, 540.0, y0 + h],
+            lines: vec![line(x0, y0, 540.0, y0 + h, text)],
+        };
+        let mut blocks = vec![
+            one(84.0, 600.0, 16.5, "Short body line."),
+            one(84.0, 626.4, 16.5, "Another short one."),
+            one(84.0, 652.8, 16.5, "And a third."),
+        ];
+        let note = |y0: f64| {
+            line(
+                108.0,
+                y0,
+                540.0,
+                y0 + 8.8,
+                "A long footnote line that carries far more characters than the body",
+            )
+        };
+        blocks.push(Block {
+            bbox: [108.0, 688.5, 540.0, 734.1],
+            lines: vec![
+                note(688.5),
+                note(697.7),
+                note(706.9),
+                note(716.1),
+                note(725.3),
+            ],
+        });
+        let paras = group_lines_into_paragraphs(&blocks, &Params::default());
+        assert_eq!(paras.iter().map(Vec::len).sum::<usize>(), 7);
+    }
+
+    #[test]
+    fn degenerate_lines_below_the_cut_terminate() {
+        // Lines under a point tall (rules, stray glyphs) above and below the
+        // cut must not send the rescue walk into a loop.
+        let one = |y0: f64, y1: f64, text: &str| Block {
+            bbox: [94.0, y0, 287.0, y1],
+            lines: vec![line(94.0, y0, 287.0, y1, text)],
+        };
+        let blocks = vec![
+            one(600.0, 616.5, "Body text line one and"),
+            one(626.4, 642.9, "body text line two and"),
+            one(700.0, 700.4, "|"),
+            one(700.2, 700.5, "|"),
+            one(722.0, 722.4, "|"),
+            one(758.0, 758.7, "|"),
+        ];
+        let paras = group_lines_into_paragraphs(&blocks, &Params::default());
+        assert!(paras.iter().map(Vec::len).sum::<usize>() >= 2);
     }
 
     #[test]
